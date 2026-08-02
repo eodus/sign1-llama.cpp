@@ -430,7 +430,8 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_SIGN1   = 43, // packed sign bits: bit 0 -> +1, bit 1 -> -1
+        GGML_TYPE_COUNT   = 44,
     };
 
     // precision
@@ -523,6 +524,7 @@ extern "C" {
         GGML_OP_PERMUTE,
         GGML_OP_TRANSPOSE,
         GGML_OP_GET_ROWS,
+        GGML_OP_MUL_ROWS_ID,
         GGML_OP_GET_ROWS_BACK,
         GGML_OP_SET_ROWS,
         GGML_OP_DIAG,
@@ -1672,6 +1674,17 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
+
+    // Indexed row scaling for MoE-style tensors.
+    // x     F32 [width, 1 or n_rows, n_tokens]
+    // scale     [width, n_expert]
+    // ids   I32 [n_rows, n_tokens]
+    // return F32 [width, n_rows, n_tokens]
+    GGML_API struct ggml_tensor * ggml_mul_rows_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * ids);
 
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,

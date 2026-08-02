@@ -5,6 +5,7 @@
 #if USE_SUBGROUP_ADD || USE_SUBGROUP_ADD_NO_SHMEM
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
 #endif
 
 #ifdef MUL_MAT_ID
@@ -89,6 +90,15 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
+layout (constant_id = 3) const uint K_CONST = 0;
+layout (constant_id = 4) const uint LOGICAL_LANE_BITS = 64;
+layout (constant_id = 5) const uint PARALLEL_ROWS = 0;
+layout (constant_id = 6) const uint K_LANES = 1;
+
+float load_fuse0_f16(const uint index) {
+    const vec2 values = unpackHalf2x16(data_fuse0_u32[index / 2u]);
+    return (index & 1u) == 0u ? values.x : values.y;
+}
 
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
@@ -104,6 +114,9 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
 #ifdef MUL_MAT_ID
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
+                }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE_ROWS_ID) != 0) {
+                    temp[j][n] *= FLOAT_TYPE(load_fuse0_f16(expert_id*p.stride_d + first_row + n));
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
                     const uint expert_i0 = gl_GlobalInvocationID.y;
@@ -160,6 +173,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE_ROWS_ID) != 0) {
+                    temp[j][n] *= FLOAT_TYPE(load_fuse0_f16(expert_id*p.stride_d + first_row + n));
+                }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
                     const uint expert_i0 = gl_GlobalInvocationID.y;
                     temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_i0]);
@@ -204,6 +220,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
 #ifdef MUL_MAT_ID
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
+                }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE_ROWS_ID) != 0) {
+                    tmpsh[j][n][0] *= FLOAT_TYPE(load_fuse0_f16(expert_id*p.stride_d + first_row + n));
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
                     const uint expert_i0 = gl_GlobalInvocationID.y;

@@ -1,0 +1,38 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) readonly buffer S { float16_t scale[]; };
+layout(binding = 2) readonly buffer I { int ids[]; };
+layout(binding = 3) writeonly buffer D { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint n_rows;
+    uint n_tokens;
+    uint x_rows;
+    uint x_nb1;
+    uint x_nb2;
+    uint scale_nb1;
+    uint ids_nb0;
+    uint ids_nb1;
+    uint dst_nb1;
+    uint dst_nb2;
+} p;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint count = p.width * p.n_rows * p.n_tokens;
+    if (index >= count) return;
+    uint col = index % p.width;
+    uint ir = index / p.width;
+    uint row = ir % p.n_rows;
+    uint token = ir / p.n_rows;
+    uint x_row = p.x_rows == 1 ? 0 : row;
+    int expert = ids[row * p.ids_nb0 + token * p.ids_nb1];
+    float xv = x[col + x_row * p.x_nb1 + token * p.x_nb2];
+    float sv = float(scale[col + uint(expert) * p.scale_nb1]);
+    dst[col + row * p.dst_nb1 + token * p.dst_nb2] = xv * sv;
+}

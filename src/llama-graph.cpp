@@ -61,6 +61,45 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
+static ggml_tensor * llama_sign1_mul_mat_id(
+        ggml_context * ctx, ggml_tensor * w, ggml_tensor * x, ggml_tensor * ids,
+        ggml_type output_type = GGML_TYPE_F32) {
+    ggml_tensor * result = ggml_mul_mat_id(ctx, w, x, ids);
+    if (output_type != result->type) {
+        GGML_ASSERT(output_type == GGML_TYPE_F16);
+        result->type = output_type;
+        result->nb[0] = ggml_type_size(output_type);
+        result->nb[1] = result->nb[0] * result->ne[0];
+        result->nb[2] = result->nb[1] * result->ne[1];
+        result->nb[3] = result->nb[2] * result->ne[2];
+    }
+    return result;
+}
+
+static void llama_sign1_attach_row_scale(ggml_tensor * matmul, ggml_tensor * scale) {
+    if (scale == nullptr) return;
+    GGML_ASSERT(matmul->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(matmul->src[3] == nullptr);
+    GGML_ASSERT(scale->type == GGML_TYPE_F16);
+    GGML_ASSERT(scale->ne[0] == matmul->ne[0]);
+    GGML_ASSERT(scale->ne[1] == matmul->src[0]->ne[2]);
+    matmul->src[3] = scale;
+}
+
+static void llama_sign1_attach_din(
+        ggml_tensor * matmul, ggml_tensor * din, ggml_tensor * unscaled_input) {
+    if (din == nullptr) return;
+    GGML_ASSERT(matmul->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(matmul->src[4] == nullptr);
+    GGML_ASSERT(matmul->src[5] == nullptr);
+    GGML_ASSERT(din->type == GGML_TYPE_F16);
+    GGML_ASSERT(din->ne[0] == matmul->src[0]->ne[0]);
+    GGML_ASSERT(din->ne[1] == matmul->src[0]->ne[2]);
+    GGML_ASSERT(unscaled_input->ne[0] == din->ne[0]);
+    matmul->src[4] = din;
+    matmul->src[5] = unscaled_input;
+}
+
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -1851,7 +1890,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * sign_down_u,  ggml_tensor * sign_down_v,
+         ggml_tensor * sign_down_din, ggml_tensor * sign_down_dmid, ggml_tensor * sign_down_dout,
+         ggml_tensor * sign_gate_u,  ggml_tensor * sign_gate_v,
+         ggml_tensor * sign_gate_din, ggml_tensor * sign_gate_dmid, ggml_tensor * sign_gate_dout,
+         ggml_tensor * sign_up_u,    ggml_tensor * sign_up_v,
+         ggml_tensor * sign_up_din, ggml_tensor * sign_up_dmid, ggml_tensor * sign_up_dout) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1872,7 +1917,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        sign_down_u, sign_down_v, sign_down_din, sign_down_dmid, sign_down_dout,
+        sign_gate_u, sign_gate_v, sign_gate_din, sign_gate_dmid, sign_gate_dout,
+        sign_up_u,   sign_up_v,   sign_up_din,   sign_up_dmid,   sign_up_dout
     );
 }
 
@@ -1900,9 +1948,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * sign_down_u,  ggml_tensor * sign_down_v,
+         ggml_tensor * sign_down_din, ggml_tensor * sign_down_dmid, ggml_tensor * sign_down_dout,
+         ggml_tensor * sign_gate_u,  ggml_tensor * sign_gate_v,
+         ggml_tensor * sign_gate_din, ggml_tensor * sign_gate_dmid, ggml_tensor * sign_gate_dout,
+         ggml_tensor * sign_up_u,    ggml_tensor * sign_up_v,
+         ggml_tensor * sign_up_din, ggml_tensor * sign_up_dmid, ggml_tensor * sign_up_dout) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
+    const bool sign1_f16_transport = n_tokens > 1;
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
     ggml_tensor * logits = nullptr;
@@ -1997,6 +2052,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
+    auto scale_input_selected = [&](ggml_tensor * x, ggml_tensor * scale, const char * name) -> ggml_tensor * {
+        if (!scale) {
+            return x;
+        }
+        ggml_tensor * x3 = x;
+        if (x->ne[1] != n_expert_used || x->ne[2] != n_tokens) {
+            x3 = ggml_reshape_3d(ctx0, x, x->ne[0], 1, n_tokens);
+        }
+        x3 = ggml_mul_rows_id(ctx0, x3, scale, selected_experts);
+        cb(x3, name, il);
+        return x3;
+    };
+
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -2072,20 +2140,63 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
         cb(up, "ffn_moe_up", il);
     } else {
-        // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        // Both SIGN1 gate/up branches have independent V factors. Expand those factors
+        // before either dependent U factor so Vulkan can execute V/V, synchronize once,
+        // then execute U/U before the SwiGLU dependency.
+        ggml_tensor * sign_h_up = nullptr;
+        ggml_tensor * sign_h_gate = nullptr;
+        if (sign_up_u && sign_up_v && sign_gate_u && sign_gate_v) {
+            ggml_tensor * up_in = scale_input_selected(cur, sign_up_din, "ffn_moe_up_din");
+            sign_h_up = llama_sign1_mul_mat_id(ctx0, sign_up_v, up_in, selected_experts,
+                sign1_f16_transport ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            llama_sign1_attach_din(sign_h_up, sign_up_din, up_in->src[0]);
+            llama_sign1_attach_row_scale(sign_h_up, sign_up_dmid);
+
+            ggml_tensor * gate_in = scale_input_selected(cur, sign_gate_din, "ffn_moe_gate_din");
+            sign_h_gate = llama_sign1_mul_mat_id(ctx0, sign_gate_v, gate_in, selected_experts,
+                sign1_f16_transport ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            llama_sign1_attach_din(sign_h_gate, sign_gate_din, gate_in->src[0]);
+            llama_sign1_attach_row_scale(sign_h_gate, sign_gate_dmid);
+
+            ggml_build_forward_expand(gf, sign_h_gate);
+            ggml_build_forward_expand(gf, sign_h_up);
+        }
+
+        if (sign_up_u && sign_up_v) {
+            if (!sign_h_up) {
+                ggml_tensor * up_in = scale_input_selected(cur, sign_up_din, "ffn_moe_up_din");
+                sign_h_up = llama_sign1_mul_mat_id(ctx0, sign_up_v, up_in, selected_experts,
+                    sign1_f16_transport ? GGML_TYPE_F16 : GGML_TYPE_F32);
+                llama_sign1_attach_din(sign_h_up, sign_up_din, up_in->src[0]);
+                llama_sign1_attach_row_scale(sign_h_up, sign_up_dmid);
+            }
+            up = llama_sign1_mul_mat_id(ctx0, sign_up_u, sign_h_up, selected_experts);
+            llama_sign1_attach_row_scale(up, sign_up_dout);
+        } else {
+            up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        }
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
         }
-
         if (up_exps_b) {
             up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
             cb(up, "ffn_moe_up_biased", il);
         }
 
-        if (gate_exps) {
+        if (sign_gate_u && sign_gate_v) {
+            if (!sign_h_gate) {
+                ggml_tensor * gate_in = scale_input_selected(cur, sign_gate_din, "ffn_moe_gate_din");
+                sign_h_gate = llama_sign1_mul_mat_id(ctx0, sign_gate_v, gate_in, selected_experts,
+                    sign1_f16_transport ? GGML_TYPE_F16 : GGML_TYPE_F32);
+                llama_sign1_attach_din(sign_h_gate, sign_gate_din, gate_in->src[0]);
+                llama_sign1_attach_row_scale(sign_h_gate, sign_gate_dmid);
+            }
+            cur = llama_sign1_mul_mat_id(ctx0, sign_gate_u, sign_h_gate, selected_experts);
+            llama_sign1_attach_row_scale(cur, sign_gate_dout);
+            cb(cur, "ffn_moe_gate", il);
+        } else if (gate_exps) {
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
@@ -2095,14 +2206,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gate_exps_s) {
             cb(cur, "ffn_moe_gate_scaled", il);
         }
-
         if (gate_exps_b) {
             cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
             cb(cur, "ffn_moe_gate_biased", il);
         }
     }
 
-    const bool has_gate = gate_exps || gate_up_exps;
+    const bool has_gate = gate_exps || gate_up_exps || (sign_gate_u && sign_gate_v);
 
     switch (type_op) {
         case LLM_FFN_SILU:
@@ -2175,7 +2285,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    if (sign_down_u && sign_down_v) {
+        ggml_tensor * down_in = scale_input_selected(cur, sign_down_din, "ffn_moe_down_din");
+        ggml_tensor * h = llama_sign1_mul_mat_id(ctx0, sign_down_v, down_in, selected_experts,
+            sign1_f16_transport ? GGML_TYPE_F16 : GGML_TYPE_F32);
+        if (sign1_f16_transport) {
+            // Batched execution preserves the exact scaled row-denormalization contract.
+            llama_sign1_attach_din(h, sign_down_din, down_in->src[0]);
+        }
+        // Generation leaves MUL_ROWS_ID materialized in the graph so Vulkan can fuse it
+        // into SwiGLU and avoid recomputing D_down_in * GLU in every down-V output tile.
+        cb(h, "ffn_moe_sign_vh", il);
+        llama_sign1_attach_row_scale(h, sign_down_dmid);
+        experts = llama_sign1_mul_mat_id(ctx0, sign_down_u, h, selected_experts);
+        llama_sign1_attach_row_scale(experts, sign_down_dout);
+        cb(experts, "ffn_moe_sign_down", il);
+    } else {
+        experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    }
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {

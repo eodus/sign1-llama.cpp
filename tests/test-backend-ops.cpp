@@ -1474,9 +1474,6 @@ struct test_case {
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
-                //for (int i = 0; i < (int) f1.size(); i++) {
-                //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
-                //}
                 //printf("\n");
                 //exit(1);
                 ud->ok = false;
@@ -4425,6 +4422,44 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     }
 }
 
+// GGML_OP_MUL_ROWS_ID
+struct test_mul_rows_id : public test_case {
+    const ggml_type scale_type;
+    const int64_t width;
+    const int64_t x_rows;
+    const int64_t n_rows;
+    const int64_t n_tokens;
+    const int64_t n_experts;
+
+    test_mul_rows_id(ggml_type scale_type, int64_t width, int64_t x_rows,
+            int64_t n_rows, int64_t n_tokens, int64_t n_experts)
+        : scale_type(scale_type), width(width), x_rows(x_rows), n_rows(n_rows),
+          n_tokens(n_tokens), n_experts(n_experts) {
+        GGML_ASSERT(x_rows == 1 || x_rows == n_rows);
+        GGML_ASSERT(n_rows <= n_experts);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(scale_type, width, x_rows, n_rows, n_tokens, n_experts);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, x_rows, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * scale = ggml_new_tensor_2d(ctx, scale_type, width, n_experts);
+        ggml_set_name(scale, "scale");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_rows, n_tokens);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * out = ggml_mul_rows_id(ctx, x, scale, ids);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_experts);
+    }
+};
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -4435,9 +4470,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const bool dmid;
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, dmid);
     }
 
     double max_nmse_err() override {
@@ -4459,16 +4495,16 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, bool dmid = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), dmid(dmid) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
         ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
-        ggml_set_name(as, "as");
+        ggml_set_name(as, type_a == GGML_TYPE_SIGN1 ? "test.ffn_gate_exps_v.weight" : "as");
 
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
         ggml_set_name(ids, "ids");
@@ -4482,6 +4518,11 @@ struct test_mul_mat_id : public test_case {
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
         ggml_set_name(out, "out");
+        if (dmid) {
+            ggml_tensor * scale = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, m, n_mats);
+            ggml_set_name(scale, "dmid");
+            out->src[3] = scale;
+        }
 
         return out;
     }
@@ -7986,6 +8027,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
     GGML_TYPE_Q2_0,
+    GGML_TYPE_SIGN1,
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
@@ -8001,6 +8043,7 @@ static const ggml_type base_types[] = {
     GGML_TYPE_Q8_0, // for I8MM tests
     GGML_TYPE_Q1_0,
     GGML_TYPE_Q2_0,
+    GGML_TYPE_SIGN1,
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_1, // for I8MM tests
     GGML_TYPE_Q4_K,
@@ -8014,6 +8057,7 @@ static const ggml_type other_types[] = {
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
     GGML_TYPE_Q2_0,
+    GGML_TYPE_SIGN1,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
@@ -8837,6 +8881,74 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
+
+    // Mature Q8_0 MMQ control at the same geometry as the custom SIGN1 path.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 19648, 256, 2048, {1, 1}, {1, 1}));
+
+    // SIGN1 q8_1 Vulkan bring-up: model-shaped non-tiny matmuls.
+    // These keep CPU reference cost reasonable while exercising the MMQ path
+    // used by Qwen SIGN1 tensors such as [19648, 2048] x [2048, n].
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_SIGN1, GGML_TYPE_F32, 19648, 1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_SIGN1, GGML_TYPE_F32, 19648, 8, 2048, {1, 1}, {1, 1}));
+    // N=512 forces the mat-mat path used by Qwen prefill, not the vector path.
+    // The small-M case is cheap enough for direct CPU-vs-GPU same-input comparison.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_SIGN1, GGML_TYPE_F32, 64, 512, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_SIGN1, GGML_TYPE_F32, 19648, 512, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_SIGN1, GGML_TYPE_F32, 19648, 256, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_SIGN1, GGML_TYPE_F32, 8192, 1, 19648, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_SIGN1, GGML_TYPE_F32, 8192, 256, 19648, {1, 1}, {1, 1}));
+    // Exact two-stage LM-head shapes at the n=16 MMQ path used by perplexity.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_SIGN1, GGML_TYPE_F32, 24448, 16, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_SIGN1, GGML_TYPE_F32, 248320, 16, 24448, {1, 1}, {1, 1}));
+    // Perplexity uses n=256 for the 512-token chunk graph; cover that exact batch shape too.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_SIGN1, GGML_TYPE_F32, 24448, 256, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_SIGN1, GGML_TYPE_F32, 248320, 256, 24448, {1, 1}, {1, 1}));
+    // BIG overflow regression: original Vulkan 32-bit pre-division index bug appears when
+    // row * K crosses 2^32 elements. Shape mirrors Qwen LM-head SIGN1 matmul tail.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_SIGN1, GGML_TYPE_F32, 248320, 1, 24448, {1, 1}, {1, 1}));
+
+    // Direct SIGN1×FP16 path matrix coverage (no internal Q8 conversion).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_SIGN1, GGML_TYPE_F16, 64, 16, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_SIGN1, GGML_TYPE_F16, 19648, 256, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_SIGN1, GGML_TYPE_F16, 8192, 256, 19648, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_SIGN1, GGML_TYPE_F16, 4, 2, false, 64, 16, 192));
+
+    // Matched mature Q2_K routed MMQ control.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 4, 2, false, 64, 16, 2048));
+
+    // Focused routed SIGN1 K=2048 MMQ localization.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_SIGN1, GGML_TYPE_F32, 256, 8, false, 64, 16, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_SIGN1, GGML_TYPE_F32, 256, 8, false, 64, 64, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_SIGN1, GGML_TYPE_F32, 4, 1, false, 64, 16, 2048, true));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_SIGN1, GGML_TYPE_F32, 256, 8, false, 1024, 1, 2048, true));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_SIGN1, GGML_TYPE_F32, 256, 8, false, 1024, 16, 2048, true));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_SIGN1, GGML_TYPE_F32, 4, 1, false, 64, 16, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_SIGN1, GGML_TYPE_F32, 4, 2, false, 64, 16, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_SIGN1, GGML_TYPE_F32, 4, 2, false, 128, 16, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_SIGN1, GGML_TYPE_F32, 4, 2, false, 1024, 8, 2048));
+
+    for (ggml_type scale_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int64_t width : {512, 1024, 2048}) {
+            test_cases.emplace_back(new test_mul_rows_id(scale_type, width, 1, 8, 1, 256));
+            test_cases.emplace_back(new test_mul_rows_id(scale_type, width, 8, 8, 1, 256));
+            test_cases.emplace_back(new test_mul_rows_id(scale_type, width, 1, 8, 16, 256));
+            test_cases.emplace_back(new test_mul_rows_id(scale_type, width, 8, 8, 16, 256));
+        }
+    }
+
+    // Exact routed-expert SIGN1 factor geometry from the current DBDBD GGUF. Four experts
+    // keep memory small while preserving the real K/M dimensions, n=1/16 paths, and
+    // intrinsic dmid/dout row scaling carried in MUL_MAT_ID src[3].
+    for (ggml_type rhs_type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t n : {1, 16}) {
+            for (bool dmid : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_SIGN1, rhs_type, 4, 2, false, 1024, n, 512,  dmid)); // down V
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_SIGN1, rhs_type, 4, 2, false, 2048, n, 1024, dmid)); // down U
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_SIGN1, rhs_type, 4, 2, false, 1024, n, 2048, dmid)); // gate/up V
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_SIGN1, rhs_type, 4, 2, false, 512,  n, 1024, dmid)); // gate/up U
+            }
+        }
+    }
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {

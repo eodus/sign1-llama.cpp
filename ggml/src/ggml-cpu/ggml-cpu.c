@@ -211,6 +211,8 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
+extern void ggml_vec_dot_sign1_q8_1(int, float *, size_t, const void *, size_t, const void *, size_t, int);
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -234,6 +236,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_q2_0,
         .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_SIGN1] = {
+        .from_float               = quantize_row_sign1,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_sign1_q8_1,
+        .vec_dot_type             = GGML_TYPE_Q8_1,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q4_0] = {
@@ -1465,6 +1473,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const struct ggml_tensor * src0,
     const struct ggml_tensor * src1,
     const struct ggml_tensor * ids,
+    const struct ggml_tensor * scale,
     const int64_t cur_a,
     const int64_t ir0_start,
     const int64_t ir0_end,
@@ -1515,6 +1524,11 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                    if (scale != NULL) {
+                        GGML_ASSERT(scale->type == GGML_TYPE_F16);
+                        const ggml_fp16_t * s = (const ggml_fp16_t *) ((const char *) scale->data + ir0*scale->nb[0] + cur_a*scale->nb[1]);
+                        tmp[ir0 - iir0] *= GGML_FP16_TO_FP32(*s);
+                    }
                 }
 
                 memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
@@ -1538,6 +1552,7 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
+    const struct ggml_tensor * scale = dst->src[3];
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1692,7 +1707,7 @@ static void ggml_compute_forward_mul_mat_id(
             const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
             ggml_compute_forward_mul_mat_id_one_chunk(
-                dst, src0, src1, ids, cur_a,
+                dst, src0, src1, ids, scale, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
                 src0_cur, matrix_rows, row_size, src1_cont, wdata
             );
@@ -1864,6 +1879,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_GET_ROWS:
             {
                 ggml_compute_forward_get_rows(params, tensor);
+            } break;
+        case GGML_OP_MUL_ROWS_ID:
+            {
+                ggml_compute_forward_mul_rows_id(params, tensor);
             } break;
         case GGML_OP_GET_ROWS_BACK:
             {
@@ -2334,6 +2353,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_GET_ROWS:
+        case GGML_OP_MUL_ROWS_ID:
         case GGML_OP_SET_ROWS:
             {
                 // FIXME: get_rows can use additional threads, but the cost of launching additional threads
@@ -2871,6 +2891,10 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                    } break;
+                case GGML_OP_MUL_ROWS_ID:
+                    {
+                        cur = (node->ne[0] * sizeof(float) + CACHE_LINE_SIZE) * n_tasks;
                     } break;
                 case GGML_OP_OUT_PROD:
                     {

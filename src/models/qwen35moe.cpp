@@ -76,9 +76,10 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         if (!hparams.is_recr(il)) {
             // Attention layers
             create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
+
             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_embd_head_k * n_head, n_embd }, flags);
 
-            // Q/K normalization for attention layers
+            // Q/K normalization
             layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, flags);
             layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, flags);
         } else {
@@ -86,6 +87,7 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
             // Create tensors with calculated dimensions
             layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", il), { n_embd, key_dim * 2 + value_dim }, TENSOR_NOT_REQUIRED);
             layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", il), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
+
             layer.ssm_conv1d     = create_tensor(tn(LLM_TENSOR_SSM_CONV1D,     "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
             layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
             layer.ssm_a          = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,             il), { hparams.ssm_dt_rank }, flags);
@@ -97,8 +99,48 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
         // Routed experts
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        // Sign-decomposed projections (optional)
+        {
+            auto try_sign = [&](llm_tensor tensor_v, llm_tensor tensor_u, auto& sv, auto& su, int64_t ne0_v, int64_t ne0_u) {
+                auto tn_v = tn(tensor_v, "weight", il);
+                auto tn_u = tn(tensor_u, "weight", il);
+                const auto * tw_v = ml.get_weight(tn_v.str().c_str());
+                const auto * tw_u = ml.get_weight(tn_u.str().c_str());
+                if (tw_v && tw_u) {
+                    const int64_t k_sign = tw_v->tensor->ne[1];
+                    sv = create_tensor(tn_v, { ne0_v, k_sign, n_expert }, 0);
+                    su = create_tensor(tn_u, { k_sign, ne0_u, n_expert }, 0);
+                }
+            };
+            try_sign(LLM_TENSOR_FFN_DOWN_EXPS_SIGN_V, LLM_TENSOR_FFN_DOWN_EXPS_SIGN_U,
+                     layer.ffn_down_exps_sign_v, layer.ffn_down_exps_sign_u, n_ff_exp, n_embd);
+            try_sign(LLM_TENSOR_FFN_GATE_EXPS_SIGN_V, LLM_TENSOR_FFN_GATE_EXPS_SIGN_U,
+                     layer.ffn_gate_exps_sign_v, layer.ffn_gate_exps_sign_u, n_embd, n_ff_exp);
+            try_sign(LLM_TENSOR_FFN_UP_EXPS_SIGN_V, LLM_TENSOR_FFN_UP_EXPS_SIGN_U,
+                     layer.ffn_up_exps_sign_v, layer.ffn_up_exps_sign_u, n_embd, n_ff_exp);
+
+            if (layer.ffn_down_exps_sign_u) {
+                const int64_t k = layer.ffn_down_exps_sign_v->ne[1];
+                layer.ffn_down_exps_dbf_din  = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_DBF_DIN,  "weight", il), { n_ff_exp, n_expert }, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_exps_dbf_dmid = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_DBF_DMID, "weight", il), { k,        n_expert }, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_exps_dbf_dout = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_DBF_DOUT, "weight", il), { n_embd,   n_expert }, TENSOR_NOT_REQUIRED);
+            }
+            if (layer.ffn_gate_exps_sign_u) {
+                const int64_t k = layer.ffn_gate_exps_sign_v->ne[1];
+                layer.ffn_gate_exps_dbf_din  = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_DBF_DIN,  "weight", il), { n_embd,   n_expert }, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_exps_dbf_dmid = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_DBF_DMID, "weight", il), { k,        n_expert }, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_exps_dbf_dout = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_DBF_DOUT, "weight", il), { n_ff_exp, n_expert }, TENSOR_NOT_REQUIRED);
+            }
+            if (layer.ffn_up_exps_sign_u) {
+                const int64_t k = layer.ffn_up_exps_sign_v->ne[1];
+                layer.ffn_up_exps_dbf_din  = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_DBF_DIN,  "weight", il), { n_embd,   n_expert }, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_exps_dbf_dmid = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_DBF_DMID, "weight", il), { k,        n_expert }, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_exps_dbf_dout = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_DBF_DOUT, "weight", il), { n_ff_exp, n_expert }, TENSOR_NOT_REQUIRED);
+            }
+        }
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert },
+            (layer.ffn_down_exps_sign_u ? TENSOR_NOT_REQUIRED : flags));
+        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, (layer.ffn_gate_exps_sign_u ? TENSOR_NOT_REQUIRED : flags));
 
         // Shared experts
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
@@ -512,7 +554,23 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
             nullptr, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            model.layers[il].ffn_down_exps_s,
+            nullptr, // selected_experts_in
+            model.layers[il].ffn_down_exps_sign_u,
+            model.layers[il].ffn_down_exps_sign_v,
+            model.layers[il].ffn_down_exps_dbf_din,
+            model.layers[il].ffn_down_exps_dbf_dmid,
+            model.layers[il].ffn_down_exps_dbf_dout,
+            model.layers[il].ffn_gate_exps_sign_u,
+            model.layers[il].ffn_gate_exps_sign_v,
+            model.layers[il].ffn_gate_exps_dbf_din,
+            model.layers[il].ffn_gate_exps_dbf_dmid,
+            model.layers[il].ffn_gate_exps_dbf_dout,
+            model.layers[il].ffn_up_exps_sign_u,
+            model.layers[il].ffn_up_exps_sign_v,
+            model.layers[il].ffn_up_exps_dbf_din,
+            model.layers[il].ffn_up_exps_dbf_dmid,
+            model.layers[il].ffn_up_exps_dbf_dout);
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation

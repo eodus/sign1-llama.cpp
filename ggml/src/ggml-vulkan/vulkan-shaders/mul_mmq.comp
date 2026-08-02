@@ -2,6 +2,7 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
 #extension GL_EXT_integer_dot_product : require
@@ -30,12 +31,17 @@ layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16
 #if defined(A_TYPE_PACKED32)
 layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
 #endif
+#if defined(DATA_B_F32)
+layout (binding = 1) readonly buffer B {float data_b[];};
+#else
 layout (binding = 1) readonly buffer B {block_q8_1_x4_packed128 data_b[];};
+#endif
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+layout (binding = 5) readonly buffer Scale {float16_t data_scale[];};
 #endif
 
 layout (push_constant) uniform parameter
@@ -56,6 +62,8 @@ layout (push_constant) uniform parameter
     uint nei1;
     uint nbi1;
     uint ne11;
+    uint padded_N;
+    uint fused_scale;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -91,12 +99,24 @@ layout (constant_id = 10) const uint WARP = 32;
 #endif
 #endif
 
+// SIGN1 stores one 64-bit block across two 32-element MMQ steps. Use the
+// one-step schedule already validated by MUL_MAT_ID while bringing up the
+// non-ID integer path; optimize multi-step preloading after equivalence tests.
+#if defined(DATA_A_SIGN1)
+#undef BK_STEP
+#define BK_STEP 1
+#endif
+
 // Shared memory cache
 shared block_a_cache buf_a[BM * BK_STEP];
 shared block_b_cache buf_b[BN * BK_STEP];
 // Register cache
 block_a_cache cache_a[WMITER * TM];
+#if defined(DATA_B_F32)
+uint cache_b_index;
+#else
 block_b_cache cache_b;
+#endif
 
 #define LOAD_VEC_A (4 * QUANT_R_MMQ)
 #define LOAD_VEC_B 16
@@ -111,6 +131,7 @@ void main() {
 
 #ifdef MUL_MAT_ID
     const uint expert_idx = gl_WorkGroupID.z;
+
     if (ic * BN >= data_expert_count[expert_idx]) {
         return;
     }
@@ -179,6 +200,8 @@ void main() {
     barrier();
 #endif
 
+
+
     // Workgroup has no work
     if (ic * BN >= _ne1) return;
 #endif
@@ -191,13 +214,19 @@ void main() {
     const uint end_k = min(p.K, (ik + 1) * p.k_split);
 #endif
 
+
+
+    // Compute the quant-block offset after dividing element strides by BK.
+    // The old `(ir * BM * p.stride_a + start_k) / BK` form can overflow 32-bit
+    // arithmetic for large SIGN1 matrices such as the Qwen LM head
+    // (e.g. rows * K > 2^32 elements) before the division happens.
     uint pos_a_ib =
 #ifdef MUL_MAT_ID
         expert_idx * (p.batch_stride_a / BK) +
 #else
         batch_idx_a * (p.batch_stride_a / BK) +
 #endif
-        (ir * BM * p.stride_a + start_k) / BK;
+        (ir * BM) * (p.stride_a / BK) + start_k / BK;
 #ifdef MUL_MAT_ID
     uint pos_b_ib = 0;
 #else
@@ -297,7 +326,9 @@ void main() {
                     const uint sums_idx = (wsic * TN + cc) * WMITER * TM + wsir * TM + cr;
 #ifdef MUL_MAT_ID
                     if (dr_warp + cr < p.M) {
-                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + cr] = D_TYPE(sums[sums_idx].x);
+                        const float value = float(sums[sums_idx].x);
+                                                const float scaled = p.fused_scale != 0u ? value * float(data_scale[expert_idx * p.M + dr_warp + cr]) : value;
+                                                data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + cr] = D_TYPE(scaled);
                     }
 #else
                     if (dr_warp + cr < p.M && dc_warp + cc < p.N) {

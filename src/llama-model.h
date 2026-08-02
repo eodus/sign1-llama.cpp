@@ -314,6 +314,23 @@ struct llama_layer {
     // ff MoE per-expert scales (NVFP4 per-tensor scale2)
     struct ggml_tensor * ffn_gate_exps_s   = nullptr;
     struct ggml_tensor * ffn_down_exps_s   = nullptr;
+
+    // Sign-decomposed routed expert projections: W ≈ D_out U D_mid V D_in
+    struct ggml_tensor * ffn_down_exps_sign_u = nullptr;
+    struct ggml_tensor * ffn_down_exps_sign_v = nullptr;
+    struct ggml_tensor * ffn_down_exps_dbf_din  = nullptr;
+    struct ggml_tensor * ffn_down_exps_dbf_dmid = nullptr;
+    struct ggml_tensor * ffn_down_exps_dbf_dout = nullptr;
+    struct ggml_tensor * ffn_gate_exps_sign_u = nullptr;
+    struct ggml_tensor * ffn_gate_exps_sign_v = nullptr;
+    struct ggml_tensor * ffn_gate_exps_dbf_din  = nullptr;
+    struct ggml_tensor * ffn_gate_exps_dbf_dmid = nullptr;
+    struct ggml_tensor * ffn_gate_exps_dbf_dout = nullptr;
+    struct ggml_tensor * ffn_up_exps_sign_u   = nullptr;
+    struct ggml_tensor * ffn_up_exps_sign_v   = nullptr;
+    struct ggml_tensor * ffn_up_exps_dbf_din  = nullptr;
+    struct ggml_tensor * ffn_up_exps_dbf_dmid = nullptr;
+    struct ggml_tensor * ffn_up_exps_dbf_dout = nullptr;
     struct ggml_tensor * ffn_up_exps_s     = nullptr;
 
     // ff MoE latent proj
@@ -571,7 +588,6 @@ struct llama_model {
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
-
 
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;

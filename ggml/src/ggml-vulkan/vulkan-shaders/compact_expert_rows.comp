@@ -1,0 +1,55 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer IDS { int data_ids[]; };
+layout(binding = 1) writeonly buffer Rows { u16vec2 compact_rows[]; };
+layout(binding = 2) readonly buffer Counts { int data_expert_count[]; };
+
+layout(push_constant) uniform parameter {
+    uint nei0;
+    uint nei1;
+    uint nbi1;
+    uint n_as;
+} p;
+
+shared uint compact_count;
+shared uint expert_offset;
+
+void main() {
+    const uint expert = gl_WorkGroupID.z;
+    const uint lane = gl_SubgroupInvocationID;
+    if (lane == 0u) {
+        compact_count = 0u;
+        expert_offset = 0u;
+        for (uint e = 0u; e < expert; ++e) {
+            expert_offset += uint(data_expert_count[e]);
+        }
+        compact_rows[expert * (p.nei1 + 1u)] =
+            u16vec2(expert_offset, uint(data_expert_count[expert]));
+    }
+    barrier();
+
+    const uint total = p.nei0 * p.nei1;
+    for (uint base = 0u; base < total; base += 64u) {
+        const uint linear = base + lane;
+        const bool valid = linear < total;
+        const uint token = linear / p.nei0;
+        const uint slot = linear - token * p.nei0;
+        const bool match = valid && uint(data_ids[token * p.nbi1 + slot]) == expert;
+        const uvec4 ballot = subgroupBallot(match);
+        const uint offset = subgroupBallotExclusiveBitCount(ballot);
+        const uint count = subgroupBallotBitCount(ballot);
+        if (match) {
+            const u16vec2 row = u16vec2(slot, token);
+            compact_rows[expert * (p.nei1 + 1u) + 1u + compact_count + offset] = row;
+            const uint global_rows_base = p.n_as * (p.nei1 + 1u);
+            compact_rows[global_rows_base + expert_offset + compact_count + offset] = row;
+        }
+        if (lane == 0u) compact_count += count;
+        barrier();
+    }
+}

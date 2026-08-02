@@ -689,6 +689,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
     },
+    [GGML_TYPE_SIGN1] = {
+        .type_name                = "sign1",
+        .blck_size                = QK_SIGN1,
+        .type_size                = sizeof(block_sign1),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_sign1,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_sign1_ref,
+    },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
         .blck_size                = QK4_0,
@@ -1032,6 +1040,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "PERMUTE",
     "TRANSPOSE",
     "GET_ROWS",
+    "MUL_ROWS_ID",
     "GET_ROWS_BACK",
     "SET_ROWS",
     "DIAG",
@@ -1100,7 +1109,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1147,6 +1156,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "permute(x)",
     "transpose(x)",
     "get_rows(x)",
+    "mul_rows_id(x,s,ids)",
     "get_rows_back(x)",
     "set_rows(x)",
     "diag(x)",
@@ -1215,7 +1225,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3907,6 +3917,33 @@ struct ggml_tensor * ggml_get_rows(
     result->op     = GGML_OP_GET_ROWS;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// ggml_mul_rows_id
+
+struct ggml_tensor * ggml_mul_rows_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F16 || scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(x->ne[0] == scale->ne[0]);
+    GGML_ASSERT(x->ne[1] == 1 || x->ne[1] == ids->ne[0]);
+    GGML_ASSERT(x->ne[2] == ids->ne[1]);
+    GGML_ASSERT(x->ne[3] == 1 && scale->ne[2] == 1 && scale->ne[3] == 1);
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, x->ne[0], ids->ne[0], ids->ne[1]);
+
+    result->op     = GGML_OP_MUL_ROWS_ID;
+    result->src[0] = x;
+    result->src[1] = scale;
+    result->src[2] = ids;
 
     return result;
 }
@@ -7939,6 +7976,7 @@ size_t ggml_quantize_chunk(
     switch (type) {
         case GGML_TYPE_Q1_0:    result = quantize_q1_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_0:    result = quantize_q2_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_SIGN1:   result = quantize_sign1  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

@@ -2,6 +2,13 @@
 
 #include "common.cuh"
 
+struct block_q8_1_bitplane {
+    uint32_t planes[8];
+    half d;
+    int16_t qsum;
+};
+static_assert(sizeof(block_q8_1_bitplane) == sizeof(block_q8_1), "Bitplane Q8 scratch must preserve block size");
+
 #include <cstdint>
 
 static __device__ __forceinline__ int get_int_b1(const void * x, const int & i32) {
@@ -103,6 +110,16 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     return s * 0x01010101;
 }
 
+// Expand four SIGN1 bits into four packed int8 values without branches or
+// lookup-memory traffic. SIGN1 bit 0 means +1 and bit 1 means -1.
+static __device__ __forceinline__ int unpack_sign1_nibble(const uint32_t bits4) {
+    uint32_t lane_bits = (bits4 * 0x00204081u) & 0x01010101u;
+    lane_bits |= lane_bits << 1;
+    lane_bits |= lane_bits << 2;
+    lane_bits |= lane_bits << 4;
+    return (int) (0x01010101u | (lane_bits & 0xFEFEFEFEu));
+}
+
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
@@ -111,6 +128,8 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 
 #define VDR_Q2_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
 #define VDR_Q2_0_Q8_1_MMQ  2  // Q2_0 group 64: 128 bits (4 ints) per block, 2 32-element chunks
+#define VDR_SIGN1_Q8_1_MMVQ 1
+#define VDR_SIGN1_Q8_1_MMQ  2  // SIGN1 has 64 bits (2 ints) per block
 
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
@@ -761,6 +780,54 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     // Apply Q2_0's single scale and this chunk's Q8_1 scale
     const float d8 = __low2float(bq8_1_chunk->ds);
     return d2 * d8 * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_sign1_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_sign1 * bs = (const block_sign1 *) vbq + kbx;
+    const block_q8_1_bitplane * bp = (const block_q8_1_bitplane *) bq8_1 + iqs;
+    const uint32_t signs = (uint32_t) (bs->qs >> (iqs * 32));
+
+    const uint32_t effective_neg = signs ^ bp->planes[7];
+    int neg_mag = 0;
+#pragma unroll
+    for (int b = 0; b < 7; ++b) {
+        neg_mag += __popc(bp->planes[b] & effective_neg) << b;
+    }
+
+    return __half2float(bp->d) * ((int) bp->qsum - 2 * neg_mag);
+}
+
+static __device__ __forceinline__ void vec_dot_sign1_q8_1_bitplane_rows4(
+        const void * __restrict__ vbq,
+        const block_q8_1 * __restrict__ bq8_1,
+        const int kbx_base,
+        const int stride_row,
+        const int iqs,
+        float (&out)[4]) {
+    const block_q8_1_bitplane * bp = (const block_q8_1_bitplane *) bq8_1 + iqs;
+    uint32_t effective_neg[4];
+    int neg_mag[4] = {0, 0, 0, 0};
+#pragma unroll
+    for (int row = 0; row < 4; ++row) {
+        const block_sign1 * bs = (const block_sign1 *) vbq + kbx_base + row * stride_row;
+        const uint32_t signs = (uint32_t) (bs->qs >> (iqs * 32));
+        effective_neg[row] = signs ^ bp->planes[7];
+    }
+#pragma unroll
+    for (int b = 0; b < 7; ++b) {
+        const uint32_t plane = bp->planes[b];
+#pragma unroll
+        for (int row = 0; row < 4; ++row) {
+            neg_mag[row] += __popc(plane & effective_neg[row]) << b;
+        }
+    }
+    const float d = __half2float(bp->d);
+#pragma unroll
+    for (int row = 0; row < 4; ++row) {
+        out[row] += d * ((int) bp->qsum - 2 * neg_mag[row]);
+    }
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(

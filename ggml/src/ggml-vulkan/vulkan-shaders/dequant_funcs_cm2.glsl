@@ -66,6 +66,28 @@ f16vec4 dequantFuncQ2_0_v(const in decodeBufQ2_0 bl, const in uint blockCoords[2
     return f16vec4((vec4(bits & 3u, (bits >> 2u) & 3u, (bits >> 4u) & 3u, bits >> 6u) - 1.0f) * float(d));
 }
 
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer decodeBufSIGN1 {
+   block_sign1 block;
+};
+
+float16_t dequantFuncSIGN1(const in decodeBufSIGN1 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint idx = coordInBlock[1];
+    const uint bit = (bl.block.qs[idx >> 5] >> (idx & 0x1fu)) & 1u;
+    return bit != 0u ? float16_t(-1.0) : float16_t(1.0);
+}
+
+f16vec4 dequantFuncSIGN1_v(const in decodeBufSIGN1 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint idx = coordInBlock[1];
+    const uint qs_nib = bl.block.qs[idx >> 5] >> (idx & 0x1cu);
+    return f16vec4(
+        (qs_nib & 1u) != 0u ? float16_t(-1.0) : float16_t(1.0),
+        (qs_nib & 2u) != 0u ? float16_t(-1.0) : float16_t(1.0),
+        (qs_nib & 4u) != 0u ? float16_t(-1.0) : float16_t(1.0),
+        (qs_nib & 8u) != 0u ? float16_t(-1.0) : float16_t(1.0));
+}
+
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ4_0 {
    block_q4_0_packed16 block;
 };
@@ -1353,6 +1375,9 @@ f16vec4 dequantFuncNVFP4_v(const in decodeBufNVFP4 bl, const in uint blockCoords
 #elif defined(DATA_A_Q2_0)
 #define dequantFuncA dequantFuncQ2_0
 #define dequantFuncA_v dequantFuncQ2_0_v
+#elif defined(DATA_A_SIGN1)
+#define dequantFuncA dequantFuncSIGN1
+#define dequantFuncA_v dequantFuncSIGN1_v
 #elif defined(DATA_A_Q4_0)
 #define dequantFuncA dequantFuncQ4_0
 #define dequantFuncA_v dequantFuncQ4_0_v

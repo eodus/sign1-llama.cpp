@@ -2,7 +2,11 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+#include "mmid.cuh"
+#include "mma.cuh"
 #include "convert.cuh"
+
+using namespace ggml_cuda_mma;
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
@@ -624,6 +628,541 @@ static void mul_mat_vec_f_cuda(
         (x, y, ids, fusion, dst, ncols, nrows, ncols_dst, stride_row, stride_col_y, stride_col_dst,
         nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+}
+
+// Native packed SIGN1 x F32 path. Each warp owns one output row, reads sign
+// bits in place, and flips the F32 sign bit directly. RHS values are loaded once
+// into shared memory and reused across eight output rows; no sign matrix or
+// quantized RHS representation is materialized.
+static __global__ void mul_mat_tile_sign1_f32_mask(
+        const block_sign1 * __restrict__ x, const float * __restrict__ y,
+        const int32_t * __restrict__ ids_src_compact, const int32_t * __restrict__ ids_dst_compact,
+        const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
+        const int ncols, const int nrows, const int ncols_dst, const int ncol_tiles,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int sis1, const int nchannels_x, const int nchannels_dst,
+        const int nsamples_x, const int nsamples_dst, const int stride_sample_x,
+        const int stride_sample_y, const int stride_sample_dst) {
+    constexpr int warp_size = 32;
+    constexpr int nwarps = 16;
+    constexpr int rows_per_block = nwarps;
+    constexpr int cols_per_block = 16;
+    constexpr int k_tile = 128;
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int linear_tid = warp*warp_size + lane;
+    const int row0 = blockIdx.x*rows_per_block;
+    const int row = row0 + warp;
+
+    __shared__ int y_offsets[cols_per_block];
+    __shared__ int dst_offsets[cols_per_block];
+    __shared__ int x_offset;
+    __shared__ int valid_cols;
+    __shared__ float y_tile[cols_per_block][k_tile];
+
+    if (linear_tid == 0) {
+        if (ids_src_compact != nullptr) {
+            const int expert = blockIdx.y;
+            const int expert_start = expert_bounds[expert];
+            const int expert_end = expert_bounds[expert + 1];
+            const int col_base = blockIdx.z*cols_per_block;
+            const int ncols_expert = expert_end - expert_start;
+            valid_cols = max(0, min(cols_per_block, ncols_expert - col_base));
+            x_offset = expert*stride_channel_x + row0*stride_row_x;
+            for (int j = 0; j < valid_cols; ++j) {
+                const int compact = expert_start + col_base + j;
+                const int src_entry = ids_src_compact[compact];
+                const int token = src_entry/sis1;
+                const int channel = src_entry - token*sis1;
+                const int dst_entry = ids_dst_compact[compact];
+                const int dst_token = dst_entry/nchannels_dst;
+                const int dst_channel = dst_entry - dst_token*nchannels_dst;
+                y_offsets[j] = channel*stride_channel_y + token*stride_col_y;
+                dst_offsets[j] = dst_channel*stride_channel_dst + dst_token*stride_col_dst;
+            }
+        } else {
+            const int sample_dst = blockIdx.z/ncol_tiles;
+            const int col_base = (blockIdx.z - sample_dst*ncol_tiles)*cols_per_block;
+            const int channel_dst = blockIdx.y;
+            const int channel_x = channel_dst/(nchannels_dst/nchannels_x);
+            const int sample_x = sample_dst/(nsamples_dst/nsamples_x);
+            valid_cols = min(cols_per_block, ncols_dst - col_base);
+            x_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+            for (int j = 0; j < valid_cols; ++j) {
+                y_offsets[j] = sample_dst*stride_sample_y + channel_dst*stride_channel_y +
+                    (col_base + j)*stride_col_y;
+                dst_offsets[j] = sample_dst*stride_sample_dst + channel_dst*stride_channel_dst +
+                    (col_base + j)*stride_col_dst;
+            }
+        }
+    }
+    __syncthreads();
+    if (valid_cols == 0) {
+        return;
+    }
+
+    float sums[cols_per_block] = {};
+    const block_sign1 * xr = x + x_offset + warp*stride_row_x;
+    for (int k0 = 0; k0 < ncols; k0 += k_tile) {
+        for (int idx = linear_tid; idx < cols_per_block*k_tile; idx += nwarps*warp_size) {
+            const int j = idx/k_tile;
+            const int k = idx - j*k_tile;
+            y_tile[j][k] = j < valid_cols && k0 + k < ncols ? y[y_offsets[j] + k0 + k] : 0.0f;
+        }
+        __syncthreads();
+
+        if (row < nrows) {
+#pragma unroll
+            for (int k = lane; k < k_tile; k += warp_size) {
+                if (k0 + k >= ncols) {
+                    break;
+                }
+                const uint64_t bits = xr[(k0 + k)/QK_SIGN1].qs;
+                const uint32_t sign_mask = ((bits >> ((k0 + k) % QK_SIGN1)) & 1ULL) ? 0x80000000u : 0u;
+#pragma unroll
+                for (int j = 0; j < cols_per_block; ++j) {
+                    const float value = __uint_as_float(__float_as_uint(y_tile[j][k]) ^ sign_mask);
+                    sums[j] += value;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int j = 0; j < cols_per_block; ++j) {
+        sums[j] = warp_reduce_sum<warp_size>(sums[j]);
+        if (lane == 0 && row < nrows && j < valid_cols) {
+            dst[dst_offsets[j] + row] = sums[j];
+        }
+    }
+}
+
+// Native packed SIGN1 x FP16 path. Signs are expanded only into shared-memory
+// WMMA tiles; the full weight matrix is never unpacked or materialized.
+template <typename TY>
+static __global__ void mul_mat_tile_sign1_mma(
+        const block_sign1 * __restrict__ x, const TY * __restrict__ y,
+        const int32_t * __restrict__ ids_src_compact, const int32_t * __restrict__ ids_dst_compact,
+        const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
+        const int ncols_pairs, const int nrows, const int ncols_dst, const int ncol_tiles, const int stride_row_x,
+        const int stride_col_y, const int stride_col_dst, const int stride_channel_x,
+        const int stride_channel_y, const int stride_channel_dst, const int sis1,
+        const int nchannels_x, const int nchannels_dst, const int nsamples_x,
+        const int nsamples_dst, const int stride_sample_x, const int stride_sample_y,
+        const int stride_sample_dst) {
+    constexpr int rows_per_block = 32;
+    constexpr int cols_per_block = 16;
+    constexpr int nwarps = 8;
+    constexpr int warp_size = 32;
+    constexpr int tile_k_padded = warp_size + 4;
+    using tile_A = tile<16, 8, half2, get_input_data_layout()>;
+    using tile_B = tile<16, 8, half2, get_input_data_layout()>;
+    using tile_C = tile<16, 16, float, DATA_LAYOUT_J_MAJOR>;
+    constexpr int ntA = rows_per_block/tile_A::I;
+
+    const int row0 = blockIdx.x*rows_per_block;
+    __shared__ int y_offsets[cols_per_block];
+    __shared__ int dst_offsets[cols_per_block];
+    __shared__ int valid_cols;
+    __shared__ int x_offset;
+    extern __shared__ char data_mma[];
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        if (ids_src_compact != nullptr) {
+            const int expert = blockIdx.y;
+            const int expert_start = expert_bounds[expert];
+            const int expert_end = expert_bounds[expert + 1];
+            const int col_base = blockIdx.z*cols_per_block;
+            const int ncols_expert = expert_end - expert_start;
+            valid_cols = max(0, min(cols_per_block, ncols_expert - col_base));
+            x_offset = expert*stride_channel_x + row0*stride_row_x;
+            for (int j = 0; j < valid_cols; ++j) {
+                const int compact = expert_start + col_base + j;
+                const int src_entry = ids_src_compact[compact];
+                const int token = src_entry/sis1;
+                const int channel = src_entry - token*sis1;
+                const int dst_entry = ids_dst_compact[compact];
+                const int dst_token = dst_entry/nchannels_dst;
+                const int dst_channel = dst_entry - dst_token*nchannels_dst;
+                y_offsets[j] = channel*stride_channel_y + token*stride_col_y;
+                dst_offsets[j] = dst_channel*stride_channel_dst + dst_token*stride_col_dst;
+            }
+        } else {
+            const int sample_dst = blockIdx.z/ncol_tiles;
+            const int col_base = (blockIdx.z - sample_dst*ncol_tiles)*cols_per_block;
+            const int channel_dst = blockIdx.y;
+            const int channel_x = channel_dst/(nchannels_dst/nchannels_x);
+            const int sample_x = sample_dst/(nsamples_dst/nsamples_x);
+            valid_cols = min(cols_per_block, ncols_dst - col_base);
+            x_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+            for (int j = 0; j < valid_cols; ++j) {
+                y_offsets[j] = sample_dst*stride_sample_y + channel_dst*stride_channel_y +
+                    (col_base + j)*stride_col_y;
+                dst_offsets[j] = sample_dst*stride_sample_dst + channel_dst*stride_channel_dst +
+                    (col_base + j)*stride_col_dst;
+            }
+        }
+    }
+    __syncthreads();
+    if (valid_cols == 0) {
+        return;
+    }
+
+    tile_C C[ntA];
+    half2 * tile_xy = reinterpret_cast<half2 *>(data_mma) +
+        threadIdx.y*(tile_A::I*tile_k_padded);
+    const block_sign1 * xe = x + x_offset;
+
+    for (int col = threadIdx.y*warp_size + threadIdx.x;
+         col < ncols_pairs; col += nwarps*warp_size) {
+        const int scalar_col = 2*col;
+        tile_A A[ntA][warp_size/tile_A::J];
+#pragma unroll
+        for (int itA = 0; itA < ntA; ++itA) {
+#pragma unroll
+            for (int i = 0; i < tile_A::I; ++i) {
+                const int global_row = row0 + itA*tile_A::I + i;
+                half2 signs = make_half2(0.0f, 0.0f);
+                if (global_row < nrows) {
+                    const block_sign1 * row = xe + (itA*tile_A::I + i)*stride_row_x;
+                    const uint64_t bits = row[scalar_col/QK_SIGN1].qs;
+                    const float s0 = ((bits >> (scalar_col % QK_SIGN1)) & 1ULL) ? -1.0f : 1.0f;
+                    const float s1 = ((bits >> ((scalar_col + 1) % QK_SIGN1)) & 1ULL) ? -1.0f : 1.0f;
+                    signs = make_half2(s0, s1);
+                }
+                tile_xy[i*tile_k_padded + threadIdx.x] = signs;
+            }
+#pragma unroll
+            for (int k0 = 0; k0 < warp_size; k0 += tile_A::J) {
+                load_ldmatrix(A[itA][k0/tile_A::J], tile_xy + k0, tile_k_padded);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < tile_B::I; ++j) {
+            half2 v = make_half2(0.0f, 0.0f);
+            if (j < valid_cols) {
+                if constexpr (std::is_same_v<TY, half>) {
+                    v = *reinterpret_cast<const half2 *>(y + y_offsets[j] + scalar_col);
+                } else {
+                    const float2 vf = *reinterpret_cast<const float2 *>(y + y_offsets[j] + scalar_col);
+                    v = ggml_cuda_cast<half2>(vf);
+                }
+            }
+            tile_xy[j*tile_k_padded + threadIdx.x] = v;
+        }
+#pragma unroll
+        for (int k0 = 0; k0 < warp_size; k0 += tile_B::J) {
+            tile_B B;
+            load_ldmatrix(B, tile_xy + k0, tile_k_padded);
+#pragma unroll
+            for (int itA = 0; itA < ntA; ++itA) {
+                mma(C[itA], A[itA][k0/tile_A::J], B);
+            }
+        }
+    }
+
+    float * combine = reinterpret_cast<float *>(data_mma);
+    constexpr int kiw = nwarps*rows_per_block + 4;
+    __syncthreads();
+#pragma unroll
+    for (int itA = 0; itA < ntA; ++itA) {
+#pragma unroll
+        for (int l = 0; l < tile_C::ne; ++l) {
+            const int i = threadIdx.y*rows_per_block + itA*tile_C::I + tile_C::get_i(l);
+            const int j = tile_C::get_j(l);
+            combine[j*kiw + i] = C[itA].x[l];
+        }
+    }
+    __syncthreads();
+
+    for (int j0 = 0; j0 < cols_per_block; j0 += nwarps) {
+        const int j = j0 + threadIdx.y;
+        if (j >= valid_cols) {
+            continue;
+        }
+        float sum = 0.0f;
+#pragma unroll
+        for (int iw = 0; iw < nwarps; ++iw) {
+            sum += combine[j*kiw + iw*rows_per_block + threadIdx.x];
+        }
+        if (row0 + threadIdx.x < nrows) {
+            dst[dst_offsets[j] + row0 + threadIdx.x] = sum;
+        }
+    }
+}
+
+template <typename TY>
+static void launch_mul_mat_tile_sign1_f(
+        ggml_backend_cuda_context & ctx, const block_sign1 * x, const TY * y,
+        const int32_t * ids, float * dst, const int64_t ncols, const int64_t nrows,
+        const int64_t ncols_dst, const int64_t stride_row_x, const int64_t stride_col_y,
+        const int64_t stride_col_dst, const int64_t nchannels_x, const int64_t nchannels_y,
+        const int64_t nchannels_dst, const int64_t stride_channel_x,
+        const int64_t stride_channel_y, const int64_t stride_channel_dst,
+        const int64_t nsamples_x, const int64_t nsamples_dst, const int64_t stride_sample_x,
+        const int64_t stride_sample_y, const int64_t stride_sample_dst,
+        const int64_t ids_stride, const int64_t sis1, cudaStream_t stream) {
+
+
+    if (ids != nullptr) {
+        const int64_t n_experts = nchannels_x;
+        const int64_t n_expert_used = nchannels_dst;
+        const int64_t ne_get_rows = ncols_dst*n_expert_used;
+        ggml_cuda_pool_alloc<int32_t> ids_src_compact(ctx.pool(), ne_get_rows);
+        ggml_cuda_pool_alloc<int32_t> ids_dst_compact(ctx.pool(), ne_get_rows);
+        ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), n_experts + 1);
+        ggml_cuda_launch_mm_ids_helper(ids, ids_src_compact.get(), ids_dst_compact.get(),
+            expert_bounds.get(), n_experts, ncols_dst, n_expert_used, nchannels_y,
+            ids_stride, sis1, false, stream);
+        if constexpr (std::is_same_v<TY, float>) {
+            const dim3 blocks((nrows + 15)/16, n_experts, (ncols_dst + 15)/16);
+            const dim3 threads(32, 16, 1);
+            mul_mat_tile_sign1_f32_mask<<<blocks, threads, 0, stream>>>(
+                x, y, ids_src_compact.get(), ids_dst_compact.get(), expert_bounds.get(), dst,
+                ncols, nrows, ncols_dst, (ncols_dst + 15)/16, stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst, sis1, nchannels_x,
+                nchannels_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y,
+                stride_sample_dst);
+        } else {
+            GGML_ASSERT(ncols % 2 == 0);
+            const dim3 blocks((nrows + 31)/32, n_experts, (ncols_dst + 15)/16);
+            const dim3 threads(32, 8, 1);
+            constexpr int shared = 8*16*(32 + 4)*sizeof(half2);
+            mul_mat_tile_sign1_mma<TY><<<blocks, threads, shared, stream>>>(
+                x, y, ids_src_compact.get(), ids_dst_compact.get(), expert_bounds.get(), dst,
+                ncols/2, nrows, ncols_dst, (ncols_dst + 15)/16, stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst, sis1, nchannels_x,
+                nchannels_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y,
+                stride_sample_dst);
+        }
+        return;
+    } else {
+        if constexpr (std::is_same_v<TY, float>) {
+            const dim3 blocks((nrows + 15)/16, nchannels_dst, ((ncols_dst + 15)/16)*nsamples_dst);
+            const dim3 threads(32, 16, 1);
+            mul_mat_tile_sign1_f32_mask<<<blocks, threads, 0, stream>>>(
+                x, y, nullptr, nullptr, nullptr, dst, ncols, nrows, ncols_dst,
+                (ncols_dst + 15)/16, stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst, 1, nchannels_x,
+                nchannels_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y,
+                stride_sample_dst);
+        } else {
+            GGML_ASSERT(ncols % 2 == 0);
+            const dim3 blocks((nrows + 31)/32, nchannels_dst, ((ncols_dst + 15)/16)*nsamples_dst);
+            const dim3 threads(32, 8, 1);
+            constexpr int shared = 8*16*(32 + 4)*sizeof(half2);
+            mul_mat_tile_sign1_mma<TY><<<blocks, threads, shared, stream>>>(
+                x, y, nullptr, nullptr, nullptr, dst, ncols/2, nrows, ncols_dst,
+                (ncols_dst + 15)/16, stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst, 1, nchannels_x,
+                nchannels_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y,
+                stride_sample_dst);
+        }
+        return;
+    }
+}
+
+template <typename TY, bool has_ids>
+static __global__ void mul_mat_vec_sign1_f(
+        const block_sign1 * __restrict__ x, const TY * __restrict__ y,
+        const int32_t * __restrict__ ids, float * __restrict__ dst,
+        const int ncols, const int nrows, const int ncols_dst, const int stride_row_x,
+        const int stride_col_y, const int stride_col_dst, const int nchannels_y, const int channel_ratio,
+        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int sample_ratio, const int stride_sample_x, const int stride_sample_y,
+        const int stride_sample_dst, const int ids_stride) {
+    constexpr int block_size = 256;
+    constexpr int rows_per_block = 16;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int tid = threadIdx.x;
+    const int row0 = blockIdx.x*rows_per_block;
+    const int channel_dst = blockIdx.y;
+    const int token_or_sample = blockIdx.z;
+
+    int channel_x;
+    int channel_y;
+    int sample_x;
+    int sample_y;
+    int sample_dst;
+    if constexpr (has_ids) {
+        channel_x = ids[channel_dst + token_or_sample*ids_stride];
+        channel_y = channel_dst % nchannels_y;
+        sample_x = 0;
+        sample_y = 0;
+        sample_dst = 0;
+    } else {
+        channel_x = channel_dst / channel_ratio;
+        channel_y = channel_dst;
+        sample_dst = token_or_sample / ncols_dst;
+        sample_x = sample_dst / sample_ratio;
+        sample_y = sample_dst;
+    }
+
+    const int col_dst = has_ids ? token_or_sample : token_or_sample % ncols_dst;
+    const block_sign1 * xr = x + int64_t(sample_x)*stride_sample_x +
+        channel_x*stride_channel_x + row0*stride_row_x;
+    const TY * yr = y + int64_t(sample_y)*stride_sample_y + channel_y*stride_channel_y +
+        int64_t(col_dst)*stride_col_y;
+    float * dr = dst + int64_t(sample_dst)*stride_sample_dst + channel_dst*stride_channel_dst +
+        int64_t(col_dst)*stride_col_dst;
+
+    // Process one byte of packed signs per task. This keeps all threads busy for
+    // the common K=2048 case and loads each 64-bit sign word only once per row
+    // and 8 input values, rather than redundantly reloading it for every value.
+    constexpr int values_per_task = 8;
+    static_assert(QK_SIGN1 % values_per_task == 0, "SIGN1 block must be byte-addressable");
+    float sums[rows_per_block] = {0.0f};
+    const int ntasks = (ncols + values_per_task - 1)/values_per_task;
+    for (int task = tid; task < ntasks; task += block_size) {
+        const int col0 = task*values_per_task;
+        const int sign_block = col0/QK_SIGN1;
+        const int bit0 = col0 % QK_SIGN1;
+        uint64_t bits[rows_per_block];
+#pragma unroll
+        for (int r = 0; r < rows_per_block; ++r) {
+            bits[r] = row0 + r < nrows ? xr[r*stride_row_x + sign_block].qs : 0;
+        }
+#pragma unroll
+        for (int j = 0; j < values_per_task; ++j) {
+            const int col = col0 + j;
+            if (col >= ncols) {
+                break;
+            }
+            const float value = ggml_cuda_cast<float>(yr[col]);
+#pragma unroll
+            for (int r = 0; r < rows_per_block; ++r) {
+                if (row0 + r < nrows) {
+                    sums[r] += ((bits[r] >> (bit0 + j)) & 1ULL) ? -value : value;
+                }
+            }
+        }
+    }
+
+    const int lane = tid % warp_size;
+    const int warp = tid / warp_size;
+    constexpr int max_warps = 8;
+    const int nwarps = block_size / warp_size;
+    __shared__ float warp_sums[rows_per_block][max_warps];
+#pragma unroll
+    for (int r = 0; r < rows_per_block; ++r) {
+        sums[r] = warp_reduce_sum<warp_size>(sums[r]);
+        if (lane == 0) {
+            warp_sums[r][warp] = sums[r];
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+#pragma unroll
+        for (int r = 0; r < rows_per_block; ++r) {
+            float total = lane < nwarps ? warp_sums[r][lane] : 0.0f;
+            total = warp_reduce_sum<warp_size>(total);
+            if (lane == 0 && row0 + r < nrows) {
+                dr[row0 + r] = total;
+            }
+        }
+    }
+}
+
+template <typename TY>
+static void launch_mul_mat_vec_sign1_f(
+        const block_sign1 * x, const TY * y, const int32_t * ids, float * dst,
+        const int64_t ncols, const int64_t nrows, const int64_t ncols_dst,
+        const int64_t stride_row_x, const int64_t stride_col_y, const int64_t stride_col_dst,
+        const int64_t nchannels_x, const int64_t nchannels_y, const int64_t nchannels_dst,
+        const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
+        const int64_t nsamples_x, const int64_t nsamples_dst, const int64_t stride_sample_x,
+        const int64_t stride_sample_y, const int64_t stride_sample_dst, const int64_t ids_stride,
+        cudaStream_t stream) {
+    GGML_ASSERT(ids || nchannels_dst % nchannels_x == 0);
+    GGML_ASSERT(nsamples_dst % nsamples_x == 0);
+    const dim3 block_dims(256, 1, 1);
+    constexpr int rows_per_block = 16;
+    const dim3 block_nums((nrows + rows_per_block - 1)/rows_per_block,
+        nchannels_dst, ids ? ncols_dst : ncols_dst*nsamples_dst);
+    const int channel_ratio = ids ? 1 : nchannels_dst / nchannels_x;
+    const int sample_ratio = nsamples_dst / nsamples_x;
+    const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+    if (ids) {
+        ggml_cuda_kernel_launch(mul_mat_vec_sign1_f<TY, true>, launch_params,
+            x, y, ids, dst, ncols, nrows, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+            nchannels_y, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_vec_sign1_f<TY, false>, launch_params,
+            x, y, ids, dst, ncols, nrows, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+            nchannels_y, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+    }
+}
+
+void ggml_cuda_mul_mat_vec_sign1_f(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_SIGN1);
+    GGML_ASSERT(src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(!ids || ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+    const size_t ts_y = ggml_type_size(src1->type);
+    const size_t ts_dst = sizeof(float);
+    const size_t ts_x = sizeof(block_sign1);
+    GGML_ASSERT(nb00 == ts_x);
+    GGML_ASSERT(nb10 == ts_y);
+    GGML_ASSERT(nb0 == ts_dst);
+
+    const int64_t sx1 = nb01 / ts_x;
+    const int64_t sx2 = nb02 / ts_x;
+    const int64_t sx3 = nb03 / ts_x;
+    const int64_t sy1 = nb11 / ts_y;
+    const int64_t sy2 = nb12 / ts_y;
+    const int64_t sy3 = nb13 / ts_y;
+    const int64_t sd1 = nb1 / ts_dst;
+    const int64_t sd2 = nb2 / ts_dst;
+    const int64_t sd3 = nb3 / ts_dst;
+
+    const int64_t ncols_dst = ids ? ne2 : ne1;
+    const int64_t nchannels_y = ids ? ne11 : ne12;
+    const int64_t nchannels_dst = ids ? ne1 : ne2;
+    const int64_t stride_col_y = ids ? sy2 : sy1;
+    const int64_t stride_col_dst = ids ? sd2 : sd1;
+    const int64_t stride_channel_y = ids ? sy1 : sy2;
+    const int64_t stride_channel_dst = ids ? sd1 : sd2;
+    const int64_t ids_stride = ids ? ids->nb[1] / sizeof(int32_t) : 0;
+    const int64_t sis1 = ids ? src1->nb[2] / src1->nb[1] : 1;
+    const int32_t * ids_d = ids ? static_cast<const int32_t *>(ids->data) : nullptr;
+
+    if (src1->type == GGML_TYPE_F16) {
+        if (ncols_dst > 1) {
+            launch_mul_mat_tile_sign1_f(ctx, static_cast<const block_sign1 *>(src0->data),
+                static_cast<const half *>(src1->data), ids_d, static_cast<float *>(dst->data),
+                ne00, ne01, ncols_dst, sx1, stride_col_y, stride_col_dst,
+                ne02, nchannels_y, nchannels_dst, sx2, stride_channel_y, stride_channel_dst,
+                ne03, ne3, sx3, sy3, sd3, ids_stride, sis1, ctx.stream());
+        } else {
+            launch_mul_mat_vec_sign1_f(static_cast<const block_sign1 *>(src0->data),
+                static_cast<const half *>(src1->data), ids_d, static_cast<float *>(dst->data),
+                ne00, ne01, ncols_dst, sx1, stride_col_y, stride_col_dst,
+                ne02, nchannels_y, nchannels_dst, sx2, stride_channel_y, stride_channel_dst,
+                ne03, ne3, sx3, sy3, sd3, ids_stride, ctx.stream());
+        }
+    } else {
+        if (ncols_dst > 1) {
+            launch_mul_mat_tile_sign1_f(ctx, static_cast<const block_sign1 *>(src0->data),
+                static_cast<const float *>(src1->data), ids_d, static_cast<float *>(dst->data),
+                ne00, ne01, ncols_dst, sx1, stride_col_y, stride_col_dst,
+                ne02, nchannels_y, nchannels_dst, sx2, stride_channel_y, stride_channel_dst,
+                ne03, ne3, sx3, sy3, sd3, ids_stride, sis1, ctx.stream());
+        } else {
+            launch_mul_mat_vec_sign1_f(static_cast<const block_sign1 *>(src0->data),
+                static_cast<const float *>(src1->data), ids_d, static_cast<float *>(dst->data),
+                ne00, ne01, ncols_dst, sx1, stride_col_y, stride_col_dst,
+                ne02, nchannels_y, nchannels_dst, sx2, stride_channel_y, stride_channel_dst,
+                ne03, ne3, sx3, sy3, sd3, ids_stride, ctx.stream());
+        }
+    }
 }
 
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,

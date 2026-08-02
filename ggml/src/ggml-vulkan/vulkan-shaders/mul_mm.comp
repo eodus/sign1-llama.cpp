@@ -2,6 +2,7 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 #ifdef FLOAT16
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -68,6 +69,7 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+layout (binding = 5) readonly buffer Scale {float16_t data_scale[];};
 #endif
 
 layout (push_constant) uniform parameter
@@ -88,6 +90,8 @@ layout (push_constant) uniform parameter
     uint nei1;
     uint nbi1;
     uint ne11;
+    uint padded_N;
+    uint fused_scale;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -135,6 +139,12 @@ shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 
 #include "mul_mm_id_funcs.glsl"
 #include "mul_mm_funcs.glsl"
+
+#ifdef MUL_MAT_ID
+float apply_fused_row_scale(float value, uint expert, uint row) {
+    return p.fused_scale != 0u ? value * float(data_scale[expert * p.M + row]) : value;
+}
+#endif
 
 void main() {
     const uint ic = gl_WorkGroupID.y;
@@ -245,6 +255,10 @@ void main() {
     const uint end_k = min(p.K, (ik + 1) * p.k_split);
 #endif
 
+    // Avoid 32-bit overflow in ir*BM*p.stride_a for very large quantized matrices.
+    // The original expression was (ir * BM * p.stride_a + start_k) / LOAD_VEC_A;
+    // for SIGN1/Q1_0 LM heads this can overflow before the division. Since these
+    // vectorized loads require stride/start_k alignment, divide first.
     uint pos_a =
 #ifdef MUL_MAT_ID
         expert_idx * (p.batch_stride_a / LOAD_VEC_A_EFF) +
@@ -252,6 +266,7 @@ void main() {
         batch_idx_a * (p.batch_stride_a / LOAD_VEC_A_EFF) +
 #endif
         (ir * BM * p.stride_a + start_k) / LOAD_VEC_A_EFF;
+        (ir * BM) * (p.stride_a / LOAD_VEC_A) + start_k / LOAD_VEC_A;
 #ifdef MUL_MAT_ID
     uint pos_b = 0;
 #else
@@ -338,7 +353,7 @@ void main() {
                         [[unroll]] for (uint cr = 0; cr < TM / 2; cr++) {
                             // [WNITER][TN][WMITER][TM / 2] -> [wsic][cc][wsir][cr]
                             const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
-                            sums[sums_idx].x = dot_product(cache_a[wsir * TM + 2 * cr    ], cache_b, sums[sums_idx].x);
+sums[sums_idx].x = dot_product(cache_a[wsir * TM + 2 * cr    ], cache_b, sums[sums_idx].x);
                             sums[sums_idx].y = dot_product(cache_a[wsir * TM + 2 * cr + 1], cache_b, sums[sums_idx].y);
                         }
                     }
@@ -387,7 +402,7 @@ void main() {
                 const u16vec2 row_idx = row_ids[row_i - ic * BN];
 
                 if (dr + cm_row * TM + store_r < p.M) {
-                    data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(apply_fused_row_scale(float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]), expert_idx, dr + cm_row * TM + store_r));
                 }
             }
             barrier();
@@ -445,10 +460,10 @@ void main() {
                     const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
 #ifdef MUL_MAT_ID
                     if (dr_warp + 2 * cr < p.M) {
-                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr] = D_TYPE(sums[sums_idx].x);
+                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr] = D_TYPE(apply_fused_row_scale(float(sums[sums_idx].x), expert_idx, dr_warp + 2 * cr));
                     }
                     if (dr_warp + 2 * cr + 1 < p.M) {
-                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(sums[sums_idx].y);
+                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(apply_fused_row_scale(float(sums[sums_idx].y), expert_idx, dr_warp + 2 * cr + 1));
                     }
 #else
                     if (dr_warp + 2 * cr < p.M && dc_warp + cc < p.N) {

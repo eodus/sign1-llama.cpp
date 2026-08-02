@@ -871,15 +871,26 @@ struct vk_device_struct {
     vk_matmul_pipeline2 pipeline_matmul_id_f16_f32;
 
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id[GGML_TYPE_COUNT];
+    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_f16[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_COUNT];
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    // [K512/K1024/K2048][F32/F16 input]
+    vk_pipeline pipeline_quantize_sign1_bitplane_mmq[3][2];
+    // [F32/F16 input]
+    vk_pipeline pipeline_quantize_sign1_bitplane_mmq_expert_major[2];
+    vk_pipeline pipeline_quantize_sign1_bitplane_mmq_scaled;
+    vk_pipeline pipeline_quantize_sign1_bitplane_mmq_swiglu_scaled;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+    vk_pipeline pipeline_sign1_rows2;
+    vk_pipeline pipeline_sign1_k2048_rows4;
+    vk_pipeline pipeline_sign1_rows4;
+    vk_pipeline pipeline_sign1_rows8;
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -909,6 +920,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_multi_add_rms[MAX_FUSED_ADDS];
 
     vk_pipeline pipeline_add_id_f32;
+    vk_pipeline pipeline_mul_rows_id_f32_f16;
 
     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
@@ -980,6 +992,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_geglu[2];
     vk_pipeline pipeline_reglu[2];
     vk_pipeline pipeline_swiglu[2];
+    vk_pipeline pipeline_swiglu_rows_id[2];
     vk_pipeline pipeline_swiglu_oai[2];
     vk_pipeline pipeline_geglu_erf[2];
     vk_pipeline pipeline_geglu_quick[2];
@@ -1050,6 +1063,13 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     vk_pipeline pipeline_count_experts;
+    vk_pipeline pipeline_compact_expert_rows;
+    vk_pipeline pipeline_sign1_u512;
+    vk_pipeline pipeline_sign1_u2048;
+    // [F32/F16 output]
+    vk_pipeline pipeline_sign1_v_k512[2];
+    vk_pipeline pipeline_sign1_v_k2048[2];
+    vk_pipeline pipeline_sign1_v_k2048_expert_major[2];
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
@@ -1190,6 +1210,8 @@ struct vk_mat_mat_push_constants {
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+#define MAT_VEC_FUSION_FLAGS_SCALE_ROWS_ID 0x10
+#define MAT_VEC_FUSION_FLAGS_INPUT_SCALE_ROWS_ID 0x20
 
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
@@ -1238,7 +1260,7 @@ struct vk_mat_mat_id_push_constants {
     uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
     uint32_t batch_stride_a; uint32_t batch_stride_b; uint32_t batch_stride_d;
     uint32_t nei0; uint32_t nei1; uint32_t nbi1; uint32_t ne11;
-    uint32_t padded_N;
+        uint32_t padded_N; uint32_t fused_scale;
 };
 struct vk_mat_vec_id_push_constants {
     uint32_t ncols;
@@ -1346,6 +1368,10 @@ struct vk_op_glu_push_constants {
     uint32_t ne2_012mp; uint32_t ne2_012L;
     uint32_t ne2_01mp;  uint32_t ne2_01L;
     uint32_t ne2_0mp;   uint32_t ne2_0L;
+    uint32_t ne11;
+    uint32_t ne12;
+    uint32_t nei0;
+    uint32_t nbi1;
 };
 static_assert(sizeof(vk_op_glu_push_constants) <= 128, "sizeof(vk_op_glu_push_constants) must be <= 128");
 
@@ -1544,6 +1570,20 @@ struct vk_op_add_id_push_constants {
     uint32_t s02;
     uint32_t s11;
     uint32_t s21;
+};
+
+struct vk_op_mul_rows_id_push_constants {
+    uint32_t width;
+    uint32_t n_rows;
+    uint32_t n_tokens;
+    uint32_t x_rows;
+    uint32_t x_nb1;
+    uint32_t x_nb2;
+    uint32_t scale_nb1;
+    uint32_t ids_nb0;
+    uint32_t ids_nb1;
+    uint32_t dst_nb1;
+    uint32_t dst_nb2;
 };
 
 struct vk_op_diag_mask_push_constants {
@@ -1907,6 +1947,14 @@ struct vk_quantize_q8_1_push_constants {
     uint32_t num_blocks;
 };
 
+struct vk_quantize_sign1_bitplane_push_constants {
+    uint32_t vector_length;
+    uint32_t vectors;
+    uint32_t input_columns;
+    uint32_t n_as;
+    uint32_t routing_nei1;
+};
+
 struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t D;
     uint32_t ne1;
@@ -2211,7 +2259,9 @@ struct ggml_backend_vk_context {
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
+    size_t prealloc_size_sign1_routing {}, prealloc_size_sign1_shared_y {};
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    vk_buffer prealloc_sign1_routing {}, prealloc_sign1_shared_y {};
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -2228,6 +2278,18 @@ struct ggml_backend_vk_context {
     // True when prealloc_y holds the padded fp16 layout used by the coopmat2 B decode-vector callback.
     // If false, then it's contiguous.
     bool prealloc_y_last_decode_vector_staging {};
+
+    // Graph-local SIGN1 caches. They are invalidated at every graph boundary, so tensor
+    // identity is used only within one immutable graph execution.
+    const ggml_tensor * sign1_routing_last_ids {};
+    uint32_t sign1_routing_last_nei0 {};
+    uint32_t sign1_routing_last_nei1 {};
+    uint32_t sign1_routing_last_n_as {};
+    const ggml_tensor * sign1_shared_y_last_tensor {};
+    uint32_t sign1_shared_y_last_vector_length {};
+    uint32_t sign1_shared_y_last_vectors {};
+    const ggml_tensor * sign1_swiglu_precomputed_scaled {};
+    const ggml_tensor * sign1_swiglu_precomputed_down_v {};
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
@@ -3874,6 +3936,7 @@ static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std:
         case GGML_TYPE_Q5_0:    block_a_size = std430_size({{16, 4}, {4, 4}, {fp_size,  fp_align}});          break; // qs[16/4] + qh + dm
         case GGML_TYPE_Q5_1:    block_a_size = std430_size({{16, 4}, {4, 4}, {fp2_size, fp2_align}});         break; // qs[16/4] + qh + dm(vec2)
         case GGML_TYPE_Q8_0:    block_a_size = std430_size({{32, 4}, {fp_size,  fp_align}});                  break; // qs[8] + dm
+        case GGML_TYPE_SIGN1:   block_a_size = std430_size({{4, 4}});                                            break; // one 32-bit sign chunk
         case GGML_TYPE_MXFP4:   block_a_size = std430_size({{32, 4}, {fp_size,  fp_align}});                  break; // qs[8] + d
         case GGML_TYPE_Q2_K:    block_a_size = std430_size({{ 8, 4}, {2, 2}, {fp2_size, fp2_align}});         break; // qs[2] + scales(u8vec2) + dm(vec2)
         case GGML_TYPE_Q3_K:    block_a_size = std430_size({{16, 4}, {fp2_size, fp2_align}});                 break; // qs[4] + d_scales(vec2)
@@ -4225,6 +4288,23 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             } else if (!ggml_vk_matmul_int_shmem_support(device, l_intid, true, t)) {
                 device->mul_mat_id_l_int[i] = false;
             }
+
+            if (t == GGML_TYPE_SIGN1) {
+                // SIGN1 has dedicated F32, FP16, and Q8_1 shaders. The generic
+                // capability table predates this custom type, so enable its slots explicitly.
+                device->mul_mat_s[i] = true;
+                device->mul_mat_m[i] = true;
+                device->mul_mat_l[i] = true;
+                device->mul_mat_id_s[i] = true;
+                device->mul_mat_id_m[i] = true;
+                device->mul_mat_id_l[i] = true;
+                device->mul_mat_s_int[i] = true;
+                device->mul_mat_m_int[i] = true;
+                device->mul_mat_l_int[i] = true;
+                device->mul_mat_id_s_int[i] = true;
+                device->mul_mat_id_m_int[i] = true;
+                device->mul_mat_id_l_int[i] = true;
+            }
         }
     }
 
@@ -4485,6 +4565,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif
         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q1_0], matmul_q1_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q2_0], matmul_q2_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_SIGN1], matmul_sign1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_0], matmul_q4_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_1], matmul_q4_1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_0], matmul_q5_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
@@ -4525,6 +4606,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif
         CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q1_0], matmul_id_subgroup_q1_0_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 5)
         CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_0], matmul_id_subgroup_q2_0_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 5)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_SIGN1], matmul_id_subgroup_sign1_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 5)
         CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0], matmul_id_subgroup_q4_0_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 5)
         CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_1], matmul_id_subgroup_q4_1_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 5)
         CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_0], matmul_id_subgroup_q5_0_f16, mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 5)
@@ -4596,6 +4678,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0], matmul_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0], matmul_q2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_SIGN1, pipeline_dequant_mul_mat_mat[GGML_TYPE_SIGN1], matmul_sign1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_SIGN1, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_SIGN1], matmul_sign1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0], matmul_q4_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_1], matmul_q4_1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_0], matmul_q5_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
@@ -4628,6 +4712,102 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             CREATE_MM2(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat[GGML_TYPE_NVFP4],   matmul_nvfp4_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         }
 
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+            if (device->integer_dot_product) {
+                constexpr uint32_t sign1_u512_bn = 8;
+                constexpr uint32_t sign1_u2048_bn = 8;
+                if (device->mul_mat_l_int[GGML_TYPE_SIGN1]) {
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_SIGN1].f32acc->l,
+                        "matmul_sign1_q8_1_l", matmul_sign1_q8_1_fp32_len, matmul_sign1_q8_1_fp32_data, "main", 3,
+                        sizeof(vk_mat_mat_push_constants), l_mmq_wg_denoms, l_warptile_mmq_int, 1);
+                }
+                if (device->mul_mat_m_int[GGML_TYPE_SIGN1]) {
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_SIGN1].f32acc->m,
+                        "matmul_sign1_q8_1_m", matmul_sign1_q8_1_fp32_len, matmul_sign1_q8_1_fp32_data, "main", 3,
+                        sizeof(vk_mat_mat_push_constants), m_mmq_wg_denoms, m_warptile_mmq_int, 1);
+                }
+                if (device->mul_mat_s_int[GGML_TYPE_SIGN1]) {
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_SIGN1].f32acc->s,
+                        "matmul_sign1_q8_1_s", matmul_sign1_q8_1_fp32_len, matmul_sign1_q8_1_fp32_data, "main", 3,
+                        sizeof(vk_mat_mat_push_constants), s_mmq_wg_denoms, s_warptile_mmq_int, 1);
+                }
+                if (device->mul_mat_id_l_int[GGML_TYPE_SIGN1]) {
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_SIGN1].f32acc->l,
+                        "matmul_id_subgroup_sign1_f32_mmq_l", matmul_id_subgroup_sign1_f32_mmq_fp32_len, matmul_id_subgroup_sign1_f32_mmq_fp32_data, "main", 6,
+                                                sizeof(vk_mat_mat_id_push_constants), l_mmq_wg_denoms, l_warptile_mmqid_int_k, 1, false, true, mul_mat_subgroup_size_16);
+                }
+                if (device->mul_mat_id_m_int[GGML_TYPE_SIGN1]) {
+                    const std::array<uint32_t, 3> sign1_m_wg_denoms = { 256, 12, 1 };
+                    const std::vector<uint32_t> sign1_m_warptile = {
+                        256, 256, 12, 32, 64, 12, 1, 4, 1, 1, mul_mat_subgroup_size_16 };
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_SIGN1].f32acc->m,
+                        "matmul_id_subgroup_sign1_f32_mmq_m", matmul_id_subgroup_sign1_f32_mmq_fp32_len, matmul_id_subgroup_sign1_f32_mmq_fp32_data, "main", 6,
+                        sizeof(vk_mat_mat_id_push_constants), sign1_m_wg_denoms, sign1_m_warptile, 1, false, true, mul_mat_subgroup_size_16);
+                }
+                {
+                    const std::array<uint32_t, 3> wg512 = { 256, sign1_u512_bn, 1 };
+                    const std::vector<uint32_t> tile512 = {
+                        256, 256, sign1_u512_bn, 32, 64, sign1_u512_bn, 1, 4, 1, 1, mul_mat_subgroup_size_16, 1024u, 512u, 1u };
+                    ggml_vk_create_pipeline(device, device->pipeline_sign1_u512,
+                        "matmul_id_sign1_u512", matmul_id_subgroup_sign1_f32_mmq_fp32_len,
+                        matmul_id_subgroup_sign1_f32_mmq_fp32_data, "main", 6,
+                        sizeof(vk_mat_mat_id_push_constants), wg512, tile512, 1, false, true, mul_mat_subgroup_size_16);
+
+                    const std::array<uint32_t, 3> wg2048 = { 256, sign1_u2048_bn, 1 };
+                    const std::vector<uint32_t> tile2048 = {
+                        256, 256, sign1_u2048_bn, 32, 64, sign1_u2048_bn, 1, 4, 1, 1, mul_mat_subgroup_size_16, 1024u, 2048u, 1u };
+                    ggml_vk_create_pipeline(device, device->pipeline_sign1_u2048,
+                        "matmul_id_sign1_u2048", matmul_id_subgroup_sign1_f32_mmq_fp32_len,
+                        matmul_id_subgroup_sign1_f32_mmq_fp32_data, "main", 6,
+                        sizeof(vk_mat_mat_id_push_constants), wg2048, tile2048, 1, false, true, mul_mat_subgroup_size_16);
+                }
+                {
+                    const std::array<uint32_t, 3> wg_v_k512 = { 256, 12, 1 };
+                    const std::vector<uint32_t> tile_v_k512 = {
+                        256, 256, 12, 32, 64, 12, 1, 4, 1, 1, mul_mat_subgroup_size_16, 512u, 1024u, 1u };
+                    ggml_vk_create_pipeline(device, device->pipeline_sign1_v_k512[0],
+                        "matmul_id_sign1_v_k512", matmul_id_subgroup_sign1_f32_mmq_fp32_len,
+                        matmul_id_subgroup_sign1_f32_mmq_fp32_data, "main", 6,
+                        sizeof(vk_mat_mat_id_push_constants), wg_v_k512, tile_v_k512, 1, false, true, mul_mat_subgroup_size_16);
+                    ggml_vk_create_pipeline(device, device->pipeline_sign1_v_k512[1],
+                        "matmul_id_sign1_v_k512_f16out", matmul_id_subgroup_sign1_f32_mmq_f16out_fp32_len,
+                        matmul_id_subgroup_sign1_f32_mmq_f16out_fp32_data, "main", 6,
+                        sizeof(vk_mat_mat_id_push_constants), wg_v_k512, tile_v_k512, 1, false, true, mul_mat_subgroup_size_16);
+
+                    const std::array<uint32_t, 3> wg_v_k2048 = { 128, 12, 1 };
+                    const std::vector<uint32_t> tile_v_k2048 = {
+                        256, 128, 12, 32, 32, 12, 1, 2, 1, 1, mul_mat_subgroup_size_16, 2048u, 1024u, 0u };
+                    const std::vector<uint32_t> tile_v_k2048_expert_major = {
+                        256, 128, 12, 32, 32, 12, 1, 2, 1, 1, mul_mat_subgroup_size_16, 2048u, 1024u, 1u };
+                    ggml_vk_create_pipeline(device, device->pipeline_sign1_v_k2048[0],
+                        "matmul_id_sign1_v_k2048", matmul_id_subgroup_sign1_f32_mmq_fp32_len,
+                        matmul_id_subgroup_sign1_f32_mmq_fp32_data, "main", 6,
+                        sizeof(vk_mat_mat_id_push_constants), wg_v_k2048, tile_v_k2048, 1, false, true, mul_mat_subgroup_size_16);
+                    ggml_vk_create_pipeline(device, device->pipeline_sign1_v_k2048[1],
+                        "matmul_id_sign1_v_k2048_f16out", matmul_id_subgroup_sign1_f32_mmq_f16out_fp32_len,
+                        matmul_id_subgroup_sign1_f32_mmq_f16out_fp32_data, "main", 6,
+                        sizeof(vk_mat_mat_id_push_constants), wg_v_k2048, tile_v_k2048, 1, false, true, mul_mat_subgroup_size_16);
+                    ggml_vk_create_pipeline(device, device->pipeline_sign1_v_k2048_expert_major[0],
+                        "matmul_id_sign1_v_k2048_expert_major", matmul_id_subgroup_sign1_f32_mmq_fp32_len,
+                        matmul_id_subgroup_sign1_f32_mmq_fp32_data, "main", 6,
+                        sizeof(vk_mat_mat_id_push_constants), wg_v_k2048, tile_v_k2048_expert_major, 1, false, true, mul_mat_subgroup_size_16);
+                    ggml_vk_create_pipeline(device, device->pipeline_sign1_v_k2048_expert_major[1],
+                        "matmul_id_sign1_v_k2048_expert_major_f16out", matmul_id_subgroup_sign1_f32_mmq_f16out_fp32_len,
+                        matmul_id_subgroup_sign1_f32_mmq_f16out_fp32_data, "main", 6,
+                        sizeof(vk_mat_mat_id_push_constants), wg_v_k2048, tile_v_k2048_expert_major, 1, false, true, mul_mat_subgroup_size_16);
+                }
+                if (device->mul_mat_id_s_int[GGML_TYPE_SIGN1]) {
+                    const std::array<uint32_t, 3> sign1_f32_wg_denoms = { 128, 12, 1 };
+                    const std::vector<uint32_t> sign1_f32_warptile = {
+                        256, 128, 12, 32, 32, 12, 1, 2, 1, 1, mul_mat_subgroup_size_16 };
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_SIGN1].f32acc->s,
+                        "matmul_id_subgroup_sign1_f32_mmq_s", matmul_id_subgroup_sign1_f32_mmq_fp32_len, matmul_id_subgroup_sign1_f32_mmq_fp32_data, "main", 6,
+                        sizeof(vk_mat_mat_id_push_constants), sign1_f32_wg_denoms, sign1_f32_warptile, 1, false, true, mul_mat_subgroup_size_16);
+                }
+            }
+#endif
+
+
         GGML_ASSERT(device->subgroup_ballot);
 
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_id_f32, matmul_id_subgroup_f32_f32, , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
@@ -4641,6 +4821,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q1_0], matmul_id_subgroup_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_0], matmul_id_subgroup_q2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_SIGN1, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_SIGN1], matmul_id_subgroup_sign1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_SIGN1, pipeline_dequant_mul_mat_mat_id_f16[GGML_TYPE_SIGN1], matmul_id_subgroup_sign1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0], matmul_id_subgroup_q4_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_1], matmul_id_subgroup_q4_1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_0], matmul_id_subgroup_q5_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
@@ -4708,13 +4890,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
 #define CREATE_MMQ(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID, REQSUBGROUPSIZE) \
         if (device->mul_mat ## ID ## _l_int[TYPE]) { \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->l, #NAMELC        "_l", NAMELC ## _len,        NAMELC ##  _data,        "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->l, #NAMELC        "_l", NAMELC ## _fp32_len,        NAMELC ##  _fp32_data,        "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         } \
         if (device->mul_mat ## ID ## _m_int[TYPE]) { \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->m, #NAMELC        "_m", NAMELC ## _len,        NAMELC ##  _data,        "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, m_ ## WARPTILE, 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->m, #NAMELC        "_m", NAMELC ## _fp32_len,        NAMELC ##  _fp32_data,        "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, m_ ## WARPTILE, 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         } \
         if (device->mul_mat ## ID ## _s_int[TYPE]) { \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->s, #NAMELC        "_s", NAMELC ## _len,        NAMELC ##  _data,        "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->s, #NAMELC        "_s", NAMELC ## _fp32_len,        NAMELC ##  _fp32_data,        "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         } \
 
         // Create 2 variants, {f16,f32} accumulator
@@ -4731,6 +4913,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0], matmul_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0], matmul_q2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+        CREATE_MM2(GGML_TYPE_SIGN1, pipeline_dequant_mul_mat_mat[GGML_TYPE_SIGN1], matmul_sign1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+        CREATE_MM2(GGML_TYPE_SIGN1, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_SIGN1], matmul_sign1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0], matmul_q4_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_1], matmul_q4_1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_0], matmul_q5_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
@@ -4761,6 +4945,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             CREATE_MMQ(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_0], matmul_q5_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
             CREATE_MMQ(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_1], matmul_q5_1_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
             CREATE_MMQ(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q8_0], matmul_q8_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
+            CREATE_MMQ(GGML_TYPE_SIGN1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_SIGN1], matmul_sign1_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
 
             CREATE_MMQ(GGML_TYPE_MXFP4, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_MXFP4], matmul_mxfp4_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
 
@@ -4779,6 +4964,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             CREATE_MM_NODOT2(GGML_TYPE_BF16, pipeline_matmul_id_bf16, matmul_id_subgroup_bf16, , wg_denoms, warptile_id, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size_16);
             CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q1_0], matmul_id_subgroup_q1_0_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
             CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_0], matmul_id_subgroup_q2_0_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+            CREATE_MM2(GGML_TYPE_SIGN1, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_SIGN1], matmul_id_subgroup_sign1_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+            CREATE_MM2(GGML_TYPE_SIGN1, pipeline_dequant_mul_mat_mat_id_f16[GGML_TYPE_SIGN1], matmul_id_subgroup_sign1_f16, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
             CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0], matmul_id_subgroup_q4_0_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
             CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_1], matmul_id_subgroup_q4_1_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
             CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_0], matmul_id_subgroup_q5_0_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
@@ -4809,6 +4996,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 CREATE_MMQ(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q5_0], matmul_id_subgroup_q5_0_q8_1, mmq_wg_denoms, warptile_mmqid_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
                 CREATE_MMQ(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q5_1], matmul_id_subgroup_q5_1_q8_1, mmq_wg_denoms, warptile_mmqid_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
                 CREATE_MMQ(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q8_0], matmul_id_subgroup_q8_0_q8_1, mmq_wg_denoms, warptile_mmqid_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+                CREATE_MMQ(GGML_TYPE_SIGN1, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_SIGN1], matmul_id_sign1_f32_mmq, mmq_wg_denoms, warptile_mmqid_int_k, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
 
                 CREATE_MMQ(GGML_TYPE_MXFP4, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_MXFP4], matmul_id_subgroup_mxfp4_q8_1, mmq_wg_denoms, warptile_mmqid_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
 
@@ -4904,6 +5092,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         CREATE_MM(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0].f32acc, matmul_q1_0_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0].f32acc, matmul_q2_0_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+        CREATE_MM(GGML_TYPE_SIGN1, pipeline_dequant_mul_mat_mat[GGML_TYPE_SIGN1].f32acc, matmul_sign1_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0].f32acc, matmul_q4_0_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_1].f32acc, matmul_q4_1_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_0].f32acc, matmul_q5_0_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
@@ -4935,6 +5124,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             CREATE_MMQ(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_0].f32acc, matmul_q5_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
             CREATE_MMQ(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_1].f32acc, matmul_q5_1_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
             CREATE_MMQ(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q8_0].f32acc, matmul_q8_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_SIGN1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_SIGN1].f32acc, matmul_sign1_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
 
             CREATE_MMQ(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q2_K].f32acc, matmul_q2_k_q8_1, mmq_wg_denoms, warptile_mmq_int_k, vk_mat_mat_push_constants, 3, );
             CREATE_MMQ(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q3_K].f32acc, matmul_q3_k_q8_1, mmq_wg_denoms, warptile_mmq_int_k, vk_mat_mat_push_constants, 3, );
@@ -4952,6 +5142,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             CREATE_MM(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q1_0].f32acc, matmul_id_subgroup_q1_0_f32, , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
             CREATE_MM(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_0].f32acc, matmul_id_subgroup_q2_0_f32, , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+            CREATE_MM(GGML_TYPE_SIGN1, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_SIGN1].f32acc, matmul_id_subgroup_sign1_f32, , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
             CREATE_MM(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0].f32acc, matmul_id_subgroup_q4_0_f32, , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
             CREATE_MM(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_1].f32acc, matmul_id_subgroup_q4_1_f32, , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
             CREATE_MM(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_0].f32acc, matmul_id_subgroup_q5_0_f32, , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
@@ -5026,6 +5217,24 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 #undef CREATE_MM
 
+    // Keep a scalar SIGN1×FP16 mat-mat pipeline available even when the
+    // cooperative-matrix capability table does not expose this custom type.
+    if (device->mul_mat_l[GGML_TYPE_SIGN1]) {
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_SIGN1].f32acc->l,
+            "matmul_sign1_f16_scalar_l", matmul_sign1_f16_len, matmul_sign1_f16_data, "main", 3,
+            sizeof(vk_mat_mat_push_constants), l_mmq_wg_denoms, l_warptile_mmq, 1);
+    }
+    if (device->mul_mat_m[GGML_TYPE_SIGN1]) {
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_SIGN1].f32acc->m,
+            "matmul_sign1_f16_scalar_m", matmul_sign1_f16_len, matmul_sign1_f16_data, "main", 3,
+            sizeof(vk_mat_mat_push_constants), m_mmq_wg_denoms, m_warptile_mmq, 1);
+    }
+    if (device->mul_mat_s[GGML_TYPE_SIGN1]) {
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_SIGN1].f32acc->s,
+            "matmul_sign1_f16_scalar_s", matmul_sign1_f16_len, matmul_sign1_f16_data, "main", 3,
+            sizeof(vk_mat_mat_push_constants), s_mmq_wg_denoms, s_warptile_mmq, 1);
+    }
+
     // mul mat vec
 
     // the number of rows computed per shader depends on GPU model and quant
@@ -5084,6 +5293,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f32_f32", arr_dmmv_bf16_f32_f32_len[reduc], arr_dmmv_bf16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f32_f32", arr_dmmv_q1_0_f32_f32_len[reduc], arr_dmmv_q1_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f32_f32", arr_dmmv_q2_0_f32_f32_len[reduc], arr_dmmv_q2_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_SIGN1][i], "mul_mat_vec_sign1_f32_f32", arr_dmmv_sign1_f32_f32_len[reduc], arr_dmmv_sign1_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {wg_size_subgroup, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_f32_f32", arr_dmmv_q4_0_f32_f32_len[reduc], arr_dmmv_q4_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_f32_f32", arr_dmmv_q4_1_f32_f32_len[reduc], arr_dmmv_q4_1_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_f32_f32", arr_dmmv_q5_0_f32_f32_len[reduc], arr_dmmv_q5_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
@@ -5111,6 +5321,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f16_f32", arr_dmmv_bf16_f16_f32_len[reduc], arr_dmmv_bf16_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f16_f32", arr_dmmv_q1_0_f16_f32_len[reduc], arr_dmmv_q1_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f16_f32", arr_dmmv_q2_0_f16_f32_len[reduc], arr_dmmv_q2_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_SIGN1][i], "mul_mat_vec_sign1_f16_f32", arr_dmmv_sign1_f16_f32_len[reduc], arr_dmmv_sign1_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {wg_size_subgroup, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_f16_f32", arr_dmmv_q4_0_f16_f32_len[reduc], arr_dmmv_q4_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_f16_f32", arr_dmmv_q4_1_f16_f32_len[reduc], arr_dmmv_q4_1_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_f16_f32", arr_dmmv_q5_0_f16_f32_len[reduc], arr_dmmv_q5_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
@@ -5165,6 +5376,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_BF16], "mul_mat_vec_id_bf16_f32",       arr_dmmv_id_bf16_f32_f32_len[reduc],    arr_dmmv_id_bf16_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2, 1, 1}, {wg_size_subgroup, 2}, 1, false, use_subgroups, force_subgroup_size);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q1_0], "mul_mat_vec_id_q1_0_f32",       arr_dmmv_id_q1_0_f32_f32_len[reduc],    arr_dmmv_id_q1_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q2_0], "mul_mat_vec_id_q2_0_f32",       arr_dmmv_id_q2_0_f32_f32_len[reduc],    arr_dmmv_id_q2_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_SIGN1], "mul_mat_vec_id_sign1_f32",       arr_dmmv_id_sign1_f32_f32_len[reduc],    arr_dmmv_id_sign1_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2, 1, 1}, {wg_size_subgroup, 2}, 1, true, use_subgroups, force_subgroup_size);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q4_0], "mul_mat_vec_id_q4_0_f32",       arr_dmmv_id_q4_0_f32_f32_len[reduc],    arr_dmmv_id_q4_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q4_1], "mul_mat_vec_id_q4_1_f32",       arr_dmmv_id_q4_1_f32_f32_len[reduc],    arr_dmmv_id_q4_1_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q5_0], "mul_mat_vec_id_q5_0_f32",       arr_dmmv_id_q5_0_f32_f32_len[reduc],    arr_dmmv_id_q5_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
@@ -5222,10 +5434,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     GGML_UNUSED(rm_iq_int);
 #endif
 
+    ggml_vk_create_pipeline(device, device->pipeline_sign1_rows2, "sign1_rows2", mul_mat_vec_id_sign1_rows2_len, mul_mat_vec_id_sign1_rows2_data, "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2, 1, 1}, {}, 1, true, true, 64);
+    ggml_vk_create_pipeline(device, device->pipeline_sign1_k2048_rows4, "sign1_k2048_rows4", mul_mat_vec_id_sign1_k2048_rows4_len, mul_mat_vec_id_sign1_k2048_rows4_data, "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {4, 1, 1}, {}, 1, true, true, 64);
+    ggml_vk_create_pipeline(device, device->pipeline_sign1_rows4, "sign1_rows4", mul_mat_vec_id_sign1_rows4_len, mul_mat_vec_id_sign1_rows4_data, "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {4, 1, 1}, {}, 1, true, true, 64);
+    ggml_vk_create_pipeline(device, device->pipeline_sign1_rows8, "sign1_rows8", mul_mat_vec_id_sign1_rows8_len, mul_mat_vec_id_sign1_rows8_data, "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {8, 1, 1}, {}, 1, true, true, 64);
+
     // dequant shaders
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_F32 ], "f32_to_f16",   dequant_f32_len,  dequant_f32_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q1_0], "dequant_q1_0", dequant_q1_0_len, dequant_q1_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 8, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q2_0], "dequant_q2_0", dequant_q2_0_len, dequant_q2_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_SIGN1], "dequant_sign1", dequant_sign1_len, dequant_sign1_data, "main", 2, 5 * sizeof(uint32_t), {256 * 8, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q4_0], "dequant_q4_0", dequant_q4_0_len, dequant_q4_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q4_1], "dequant_q4_1", dequant_q4_1_len, dequant_q4_1_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q5_0], "dequant_q5_0", dequant_q5_0_len, dequant_q5_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
@@ -5254,6 +5472,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_BF16], "get_rows_bf16", get_rows_bf16_len, get_rows_bf16_data, "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q1_0], "get_rows_q1_0", get_rows_q1_0_len, get_rows_q1_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q2_0], "get_rows_q2_0", get_rows_q2_0_len, get_rows_q2_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_SIGN1], "get_rows_sign1", get_rows_sign1_len, get_rows_sign1_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q4_0], "get_rows_q4_0", get_rows_q4_0_len, get_rows_q4_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q4_1], "get_rows_q4_1", get_rows_q4_1_len, get_rows_q4_1_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q5_0], "get_rows_q5_0", get_rows_q5_0_len, get_rows_q5_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
@@ -5282,6 +5501,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_BF16], "get_rows_bf16_f32", get_rows_bf16_f32_len, get_rows_bf16_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_Q1_0], "get_rows_q1_0_f32", get_rows_q1_0_f32_len, get_rows_q1_0_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_Q2_0], "get_rows_q2_0_f32", get_rows_q2_0_f32_len, get_rows_q2_0_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_SIGN1], "get_rows_sign1_f32", get_rows_sign1_f32_len, get_rows_sign1_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_Q4_0], "get_rows_q4_0_f32", get_rows_q4_0_f32_len, get_rows_q4_0_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_Q4_1], "get_rows_q4_1_f32", get_rows_q4_1_f32_len, get_rows_q4_1_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_Q5_0], "get_rows_q5_0_f32", get_rows_q5_0_f32_len, get_rows_q5_0_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
@@ -5318,6 +5538,48 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     } else {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_len, quantize_q8_1_x4_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
     }
+    const char * sign1_quant_name[3] = {
+        "quantize_sign1_bitplane_mmq_k512",
+        "quantize_sign1_bitplane_mmq_k1024",
+        "quantize_sign1_bitplane_mmq_k2048",
+    };
+    for (uint32_t i = 0; i < 3; ++i) {
+        for (uint32_t input_type = 0; input_type < 2; ++input_type) {
+            const bool input_f16 = input_type == 1;
+            const std::string pipeline_name = std::string(sign1_quant_name[i]) +
+                (input_f16 ? "_f16" : "_f32");
+            ggml_vk_create_pipeline(device, device->pipeline_quantize_sign1_bitplane_mmq[i][input_type],
+                pipeline_name.c_str(),
+                input_f16 ? quantize_sign1_bitplane_mmq_f16_len : quantize_sign1_bitplane_mmq_f32_len,
+                input_f16 ? quantize_sign1_bitplane_mmq_f16_data : quantize_sign1_bitplane_mmq_f32_data,
+                "main", 2, sizeof(vk_quantize_sign1_bitplane_push_constants),
+                {1, 1, 1}, {64u}, 1, true);
+        }
+    }
+    ggml_vk_create_pipeline(device, device->pipeline_quantize_sign1_bitplane_mmq_expert_major[0],
+        "quantize_sign1_bitplane_mmq_f32_expert_major",
+        quantize_sign1_bitplane_mmq_f32_expert_major_len,
+        quantize_sign1_bitplane_mmq_f32_expert_major_data,
+        "main", 3, sizeof(vk_quantize_sign1_bitplane_push_constants),
+        {1, 1, 1}, {64u}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_quantize_sign1_bitplane_mmq_expert_major[1],
+        "quantize_sign1_bitplane_mmq_f16_expert_major",
+        quantize_sign1_bitplane_mmq_f16_expert_major_len,
+        quantize_sign1_bitplane_mmq_f16_expert_major_data,
+        "main", 3, sizeof(vk_quantize_sign1_bitplane_push_constants),
+        {1, 1, 1}, {64u}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_quantize_sign1_bitplane_mmq_scaled,
+        "quantize_sign1_bitplane_mmq_scaled",
+        quantize_sign1_bitplane_mmq_scaled_len,
+        quantize_sign1_bitplane_mmq_scaled_data,
+        "main", 4, sizeof(vk_quantize_sign1_bitplane_push_constants),
+        {1, 1, 1}, {128u}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_quantize_sign1_bitplane_mmq_swiglu_scaled,
+        "quantize_sign1_bitplane_mmq_swiglu_scaled",
+        quantize_sign1_bitplane_mmq_swiglu_scaled_len,
+        quantize_sign1_bitplane_mmq_swiglu_scaled_data,
+        "main", 5, sizeof(vk_quantize_sign1_bitplane_push_constants),
+        {1, 1, 1}, {128u}, 1, true);
 
     for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
         if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
@@ -5367,6 +5629,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q1_0], "cpy_f32_q1_0", cpy_f32_q1_0_len, cpy_f32_q1_0_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q2_0], "cpy_f32_q2_0", cpy_f32_q2_0_len, cpy_f32_q2_0_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_SIGN1], "cpy_f32_sign1", cpy_f32_sign1_len, cpy_f32_sign1_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q4_0], "cpy_f32_q4_0", cpy_f32_q4_0_len, cpy_f32_q4_0_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q4_1], "cpy_f32_q4_1", cpy_f32_q4_1_len, cpy_f32_q4_1_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q5_0], "cpy_f32_q5_0", cpy_f32_q5_0_len, cpy_f32_q5_0_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
@@ -5396,6 +5659,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q1_0], "cpy_q1_0_f32", cpy_q1_0_f32_len, cpy_q1_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q1_0), 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q2_0], "cpy_q2_0_f32", cpy_q2_0_f32_len, cpy_q2_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q2_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_SIGN1], "cpy_sign1_f32", cpy_sign1_f32_len, cpy_sign1_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_SIGN1), 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q4_0], "cpy_q4_0_f32", cpy_q4_0_f32_len, cpy_q4_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q4_0), 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q4_1], "cpy_q4_1_f32", cpy_q4_1_f32_len, cpy_q4_1_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q4_1), 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q5_0], "cpy_q5_0_f32", cpy_q5_0_f32_len, cpy_q5_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q5_0), 1, 1}, {}, 1);
@@ -5437,6 +5701,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_add_id_f32, "add_id_f32", add_id_f32_len, add_id_f32_data, "main", 4, sizeof(vk_op_add_id_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_rows_id_f32_f16, "mul_rows_id_f32_f16", mul_rows_id_f32_f16_len, mul_rows_id_f32_f16_data, "main", 4, sizeof(vk_op_mul_rows_id_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_acc_f32, "acc_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_set_f32, "set_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 0}, 1);
@@ -5521,6 +5786,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     CREATE_GLU(geglu)
     CREATE_GLU(reglu)
     CREATE_GLU(swiglu)
+    ggml_vk_create_pipeline(device, device->pipeline_swiglu_rows_id[0], "swiglu_rows_id_f32", swiglu_rows_id_f32_len, swiglu_rows_id_f32_data, "main", 5, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_swiglu_rows_id[1], "swiglu_rows_id_f16", swiglu_rows_id_f16_len, swiglu_rows_id_f16_data, "main", 5, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true);
     CREATE_GLU(swiglu_oai)
     CREATE_GLU(geglu_erf)
     CREATE_GLU(geglu_quick)
@@ -5619,6 +5886,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_count_equal_i32, "count_equal_i32", count_equal_i32_len, count_equal_i32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, { device->subgroup_size }, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_count_experts, "count_experts", count_experts_len, count_experts_data, "main", 2, sizeof(vk_op_count_experts_push_constants), {1, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_compact_expert_rows, "compact_expert_rows", compact_expert_rows_len, compact_expert_rows_data, "main", 3, 4 * sizeof(uint32_t), {64, 1, 1}, {}, 1, true, true, 64);
 
     for (auto &s : device->pipeline_solve_tri_f32) {
         const vk_solve_tri_pipeline_state &state = s.first;
@@ -7460,6 +7728,7 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type 
         case GGML_TYPE_F32:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_SIGN1:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -7519,7 +7788,6 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     // MMQ
     if (src1_type == GGML_TYPE_Q8_1) {
         vk_matmul_pipeline pipelines = ctx->device->pipeline_dequant_mul_mat_mat_q8_1[src0_type].f32acc;
-
         if (pipelines->is_empty()) {
             return nullptr;
         }
@@ -7527,13 +7795,15 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         return pipelines;
     }
 
-    if (src1_type != GGML_TYPE_F32 && !ctx->device->coopmat2) {
+    if (src1_type != GGML_TYPE_F32 && !ctx->device->coopmat2 &&
+        !(src0_type == GGML_TYPE_SIGN1 && src1_type == GGML_TYPE_F16)) {
         return nullptr;
     }
 
     switch (src0_type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_SIGN1:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -7558,6 +7828,15 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
             break;
         default:
             return nullptr;
+    }
+
+    if (src1_type == GGML_TYPE_F16) {
+        // SIGN1 reductions are long and cancellation-heavy. Match the CPU and CUDA
+        // reference contract: FP16 RHS storage with FP32 accumulation.
+        if (src0_type == GGML_TYPE_SIGN1) {
+            return ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f32acc;
+        }
+        return prec == GGML_PREC_DEFAULT ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f32acc;
     }
 
     if (ctx->device->coopmat2) {
@@ -7603,6 +7882,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_SIGN1:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -7658,6 +7938,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
 
 static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
     VK_LOG_DEBUG("ggml_vk_get_mul_mat_mat_id_pipeline()");
+
     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
         return ctx->device->pipeline_matmul_id_f32;
     }
@@ -7691,11 +7972,12 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
         return pipelines;
     }
 
-    GGML_ASSERT(src1_type == GGML_TYPE_F32 || (ctx->device->coopmat2 && src1_type == GGML_TYPE_F16));
+    GGML_ASSERT(src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_F16);
 
     switch (src0_type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_SIGN1:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -7722,9 +8004,11 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
             return nullptr;
     }
 
-    vk_matmul_pipeline2& mmp = ctx->device->pipeline_dequant_mul_mat_mat_id[src0_type];
+    vk_matmul_pipeline2& mmp = src1_type == GGML_TYPE_F16
+        ? ctx->device->pipeline_dequant_mul_mat_mat_id_f16[src0_type]
+        : ctx->device->pipeline_dequant_mul_mat_mat_id[src0_type];
     // XXX TODO 'prec' is not actually allowed in mul_mat_id.
-    bool prefer_fp16acc = ctx->device->fp16 /*&& prec == GGML_PREC_DEFAULT*/;
+    bool prefer_fp16acc = ctx->device->fp16 && src0_type != GGML_TYPE_SIGN1 /*&& prec == GGML_PREC_DEFAULT*/;
     bool support_fp16acc = !mmp.f16acc->is_empty();
     bool support_fp32acc = !mmp.f32acc->is_empty();
 
@@ -7768,6 +8052,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_SIGN1:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -7818,6 +8103,17 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
         return ctx->device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[dmmv_wg][a_type];
     }
 
+    if (a_type == GGML_TYPE_SIGN1) {
+        if (k == 2048) {
+            return ctx->device->pipeline_sign1_rows2;
+        }
+        if (k == 1024) {
+            return ctx->device->pipeline_sign1_rows4;
+        }
+        if (k == 512) {
+            return ctx->device->pipeline_sign1_rows8;
+        }
+    }
     return ctx->device->pipeline_dequant_mul_mat_vec_id_f32[dmmv_wg][a_type];
 }
 
@@ -8578,6 +8874,19 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     const bool mm_m = is_q8_1 ? ctx->device->mul_mat_m_int[src0_type] : ctx->device->mul_mat_m[src0_type];
     const bool mm_s = is_q8_1 ? ctx->device->mul_mat_s_int[src0_type] : ctx->device->mul_mat_s[src0_type];
 
+    // SIGN1 uses a 32-element MMQ step over a 64-bit storage block. The
+    // medium/small integer tile configurations are validated for this schedule;
+    // the generic large configuration is not equivalent yet. Keep the scalable
+    // medium tile for large matrices rather than falling back to the scalar
+    // correctness shader.
+    if (is_q8_1 && src0_type == GGML_TYPE_SIGN1) {
+        if (mm_s && (m <= 32 || n <= 32)) {
+            return aligned ? mmp->a_s : mmp->s;
+        }
+        GGML_ASSERT(mm_m);
+        return aligned ? mmp->a_m : mmp->m;
+    }
+
     if (ctx->device->coopmat2) {
         const uint32_t shader_core_count = ctx->device->shader_core_count;
         const uint32_t tiles_l = CEIL_DIV(m, mmp->a_l->wg_denoms[0]) * CEIL_DIV(n, mmp->a_l->wg_denoms[1]);
@@ -8627,6 +8936,7 @@ static void ggml_vk_matmul(
         uint32_t split_k, uint32_t batch, uint32_t ne02, uint32_t ne12, uint32_t broadcast2, uint32_t broadcast3,
         uint32_t padded_n) {
         VK_LOG_DEBUG("ggml_vk_matmul(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), split_k: (" << (split_k_buffer.buffer != nullptr ? split_k_buffer.buffer->buffer : VK_NULL_HANDLE) << ", " << split_k_buffer.offset << ", " << split_k_buffer.size << "), m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", split_k: " << split_k << ", batch: " << batch << ", ne02: " << ne02 << ", ne12: " << ne12 << ", broadcast2: " << broadcast2 << ", broadcast3: " << broadcast3 << ", padded_n: " << padded_n << ")");
+
     if (split_k == 1) {
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(batch, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
 
@@ -8668,7 +8978,7 @@ static void ggml_vk_matmul(
     ctx->prealloc_split_k_need_sync = true;
 }
 
-static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
+static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, uint32_t k, bool aligned, ggml_type src0_type, ggml_type src1_type) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_id_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
 
     // The q8_1 (integer dot) mmq path uses a different shader with its own
@@ -8677,6 +8987,11 @@ static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ct
     const bool mm_l = is_q8_1 ? ctx->device->mul_mat_id_l_int[src0_type] : ctx->device->mul_mat_id_l[src0_type];
     const bool mm_m = is_q8_1 ? ctx->device->mul_mat_id_m_int[src0_type] : ctx->device->mul_mat_id_m[src0_type];
     const bool mm_s = is_q8_1 ? ctx->device->mul_mat_id_s_int[src0_type] : ctx->device->mul_mat_id_s[src0_type];
+
+    if (is_q8_1 && src0_type == GGML_TYPE_SIGN1) {
+        GGML_ASSERT(mm_s && mm_m);
+        return k == 2048 ? mmp->s : mmp->m;
+    }
 
     if (ctx->device->coopmat2) {
         // Use large shader when the N dimension is greater than the medium shader's tile size
@@ -8703,23 +9018,23 @@ static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ct
 
 static uint32_t ggml_vk_guess_matmul_id_pipeline_align(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, int m, int n, ggml_type src0_type, ggml_type src1_type) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline_align(" << m << ", " << n << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
-    return ggml_vk_guess_matmul_id_pipeline(ctx, mmp, m, n, true, src0_type, src1_type)->align;
+    return ggml_vk_guess_matmul_id_pipeline(ctx, mmp, m, n, 0, true, src0_type, src1_type)->align;
 }
 
 static void ggml_vk_matmul_id(
         ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline& pipeline,
-        vk_subbuffer&& a, vk_subbuffer&& b, vk_subbuffer&& d, vk_subbuffer&& ids, const vk_subbuffer & expert_count_buf,
+        vk_subbuffer&& a, vk_subbuffer&& b, vk_subbuffer&& d, vk_subbuffer&& ids, const vk_subbuffer & expert_count_buf, vk_subbuffer&& scale,
         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
-        uint32_t padded_n) {
+        uint32_t padded_n, bool fused_scale) {
     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
-                                              nei0, nei1, nbi1, ne11, padded_n };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
+                                              nei0, nei1, nbi1, ne11, padded_n, fused_scale ? 1u : 0u };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, scale }, pc, { m, nei1, n_as });
 }
 
 static bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
@@ -8805,6 +9120,7 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         switch (to) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_SIGN1:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -8821,6 +9137,7 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         switch (src->type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_SIGN1:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -8942,6 +9259,73 @@ static void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& sub
     ggml_vk_sync_buffers(ctx, subctx);
 }
 
+static uint32_t ggml_vk_sign1_quant_pipeline_index(uint32_t vector_length) {
+    GGML_ASSERT(vector_length == 512 || vector_length == 1024 || vector_length == 2048);
+    return vector_length == 512 ? 0 : vector_length == 1024 ? 1 : 2;
+}
+
+static void ggml_vk_quantize_sign1_bitplane_mmq(ggml_backend_vk_context * ctx, vk_context & subctx,
+        vk_pipeline pipeline, const vk_subbuffer & in, const vk_subbuffer & out,
+        uint32_t vector_length, uint32_t vectors) {
+    const vk_quantize_sign1_bitplane_push_constants pc = { vector_length, vectors, 0, 0, 0 };
+    const uint32_t vectors_per_wave = 2048u / vector_length;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { in, out }, pc, { CEIL_DIV(vectors, vectors_per_wave), 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
+static void ggml_vk_quantize_sign1_bitplane_mmq_expert_major(
+        ggml_backend_vk_context * ctx, vk_context & subctx, vk_pipeline pipeline,
+        const vk_subbuffer & in, const vk_subbuffer & out, const vk_subbuffer & rows,
+        const vk_subbuffer & scale,
+        uint32_t vector_length, uint32_t vectors, uint32_t input_columns,
+        uint32_t n_as, uint32_t routing_nei1) {
+    const vk_quantize_sign1_bitplane_push_constants pc = {
+        vector_length, vectors, input_columns, n_as, routing_nei1 };
+    const uint32_t vectors_per_wave = 2048u / vector_length;
+    if (scale.buffer != nullptr) {
+        const uint32_t vectors_per_workgroup = 2u * vectors_per_wave;
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { in, out, rows, scale }, pc,
+            { CEIL_DIV(vectors, vectors_per_workgroup), 1, 1 });
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { in, out, rows }, pc, { CEIL_DIV(vectors, vectors_per_wave), 1, 1 });
+    }
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
+static void ggml_vk_quantize_sign1_bitplane_mmq_scaled(
+        ggml_backend_vk_context * ctx, vk_context & subctx, vk_pipeline pipeline,
+        const vk_subbuffer & in, const vk_subbuffer & out, const vk_subbuffer & rows,
+        const vk_subbuffer & scale, uint32_t vector_length, uint32_t n_expert_used,
+        uint32_t input_columns, uint32_t n_as, uint32_t routing_nei1) {
+    const vk_quantize_sign1_bitplane_push_constants pc = {
+        vector_length, n_expert_used, input_columns, n_as, routing_nei1 };
+    const uint32_t vectors_per_wave = 2048u / vector_length;
+    const uint32_t vectors_per_workgroup = 2u * vectors_per_wave;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { in, out, rows, scale }, pc,
+        { CEIL_DIV(n_expert_used, vectors_per_workgroup), 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
+static void ggml_vk_quantize_sign1_bitplane_mmq_swiglu_scaled(
+        ggml_backend_vk_context * ctx, vk_context & subctx, vk_pipeline pipeline,
+        const vk_subbuffer & gate, const vk_subbuffer & up, const vk_subbuffer & out,
+        const vk_subbuffer & rows, const vk_subbuffer & scale,
+        uint32_t vector_length, uint32_t vectors, uint32_t input_columns,
+        uint32_t n_as, uint32_t routing_nei1) {
+    const vk_quantize_sign1_bitplane_push_constants pc = {
+        vector_length, vectors, input_columns, n_as, routing_nei1 };
+    const uint32_t vectors_per_wave = 2048u / vector_length;
+    const uint32_t vectors_per_workgroup = 2u * vectors_per_wave;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { gate, up, out, rows, scale }, pc,
+        { CEIL_DIV(vectors, vectors_per_workgroup), 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
 static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * ctx, vk_pipeline &pipeline) {
     GGML_UNUSED(ctx);
 #if defined(VK_EXT_shader_64bit_indexing)
@@ -9015,29 +9399,31 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
     // Check for mmq first
-    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
+    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (src0->type == GGML_TYPE_SIGN1 ? GGML_PREC_F32 : (ggml_prec)dst->op_params[0])) : nullptr;
 
     if (mmp == nullptr) {
         // Fall back to f16 dequant mul mat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
+        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (src0->type == GGML_TYPE_SIGN1 ? GGML_PREC_F32 : (ggml_prec)dst->op_params[0]));
         quantize_y = false;
     }
 
     const bool qx_needs_dequant = mmp == nullptr || x_non_contig;
     const bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
 
-    if (qx_needs_dequant) {
-        // Fall back to dequant + f16 mulmat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, (ggml_prec)dst->op_params[0]);
+    if (qy_needs_dequant && !quantize_y) {
+        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, f16_type, (src0->type == GGML_TYPE_SIGN1 ? GGML_PREC_F32 : (ggml_prec)dst->op_params[0]));
     }
 
-    // Not implemented
-    GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
+    if (qx_needs_dequant) {
+        // Fall back to dequant + f16 mulmat
+        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, (src0->type == GGML_TYPE_SIGN1 ? GGML_PREC_F32 : (ggml_prec)dst->op_params[0]));
+    }
 
-    const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
+    const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (qy_needs_dequant ? f16_type : (y_f32_kernel ? GGML_TYPE_F32 : src1->type));
 
     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
-    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
+    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8 &&
+        !(src0->type == GGML_TYPE_SIGN1 && effective_src1_type == GGML_TYPE_F16);
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
 
@@ -9176,6 +9562,20 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                 ggml_vk_sync_buffers(ctx, subctx);
             }
             ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0));
+            ctx->prealloc_y_last_pipeline_used = to_fp16_vk_1.get();
+            ctx->prealloc_y_last_tensor_used = src1;
+            ctx->prealloc_y_last_decode_vector_staging = false;
+        }
+    } else if (qy_needs_dequant) {
+        if (ctx->prealloc_y_last_pipeline_used != to_fp16_vk_1.get() ||
+            ctx->prealloc_y_last_tensor_used != src1 ||
+            ctx->prealloc_y_last_decode_vector_staging) {
+            if (ctx->prealloc_y_need_sync) {
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+            const std::vector<uint32_t> pc = { (uint32_t)ne11, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)(ggml_nelements(src1)) };
+            ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_1, { vk_subbuffer{ d_Qy, qy_buf_offset, qy_sz }, vk_subbuffer{ d_Y, 0, y_sz } }, pc, { (uint32_t)(y_ne), 1, 1});
+            ggml_vk_sync_buffers(ctx, subctx);
             ctx->prealloc_y_last_pipeline_used = to_fp16_vk_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
             ctx->prealloc_y_last_decode_vector_staging = false;
@@ -9862,6 +10262,21 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
 }
 
 static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    const bool sign1_prequant_scale = src0->type == GGML_TYPE_SIGN1 &&
+        dst->src[4] != nullptr && dst->src[5] != nullptr;
+    const ggml_tensor * prequant_scale = sign1_prequant_scale ? dst->src[4] : nullptr;
+    const ggml_tensor * src1_data = sign1_prequant_scale ? dst->src[5] : src1;
+    if (sign1_prequant_scale) {
+        GGML_ASSERT(src1->op == GGML_OP_MUL_ROWS_ID);
+        GGML_ASSERT(src1->src[0] == src1_data);
+        GGML_ASSERT(src1->src[1] == prequant_scale);
+        GGML_ASSERT(src1->src[2] == ids);
+        GGML_ASSERT(src1_data->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(src1_data));
+        GGML_ASSERT(prequant_scale->type == GGML_TYPE_F16);
+        GGML_ASSERT(prequant_scale->ne[0] == src0->ne[0]);
+        GGML_ASSERT(prequant_scale->ne[1] == src0->ne[2]);
+    }
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
@@ -9895,7 +10310,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
     ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
-    ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
+    ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1_data->buffer->context;
     ggml_backend_vk_buffer_context * ids_buf_ctx = (ggml_backend_vk_buffer_context *)ids->buffer->context;
 
     vk_buffer d_Qx = nullptr;
@@ -9911,7 +10326,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     if (ctx->device->uma) {
         ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
-        ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
+        ggml_vk_host_get(ctx->device, src1_data->data, d_Qy, qy_buf_offset);
         ggml_vk_host_get(ctx->device, ids->data, d_ids, ids_buf_offset);
         src0_uma = d_Qx != nullptr;
         src1_uma = d_Qy != nullptr;
@@ -9939,16 +10354,29 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 #else
     const bool y_decode_vector_staging = false;
 #endif
-    const bool y_non_contig = y_decode_vector_staging ||
-                              (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
+    const bool y_non_contig = !sign1_prequant_scale && (y_decode_vector_staging ||
+                              (ctx->device->coopmat2 && src0->type != GGML_TYPE_SIGN1 && src1->type == GGML_TYPE_F32) ||
                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
-                              !ggml_vk_dim01_contiguous(src1);
+                              !ggml_vk_dim01_contiguous(src1));
 
     const uint32_t y_staged_row_stride = y_decode_vector_staging ? (uint32_t)ggml_vk_align_size(ne10, 4) : (uint32_t)ne10;
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
+    const bool sign1_bitplane_mmq = src0->type == GGML_TYPE_SIGN1 &&
+                                    (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
+                                    (ne10 == 2048 || ne10 == 1024 || ne10 == 512) && nei1 > 8;
+    const bool sign1_swiglu_y = sign1_bitplane_mmq && sign1_prequant_scale && ne10 == 512 &&
+        src1_data->op == GGML_OP_GLU && ggml_get_glu_op(src1_data) == GGML_GLU_OP_SWIGLU &&
+        src1_data->src[0] != nullptr && src1_data->src[1] != nullptr &&
+        src1_data->src[0]->type == GGML_TYPE_F32 && src1_data->src[1]->type == GGML_TYPE_F32;
+    const bool sign1_precompact = sign1_bitplane_mmq;
+    const bool sign1_reuse_routing = sign1_precompact;
+    // Gate and up V consume the same 512 hidden-state vectors. Preserve their
+    // shared-exponent Q8 representation across the intervening expert-specific U path.
+    const bool sign1_shared_y = sign1_bitplane_mmq && !sign1_prequant_scale && ne10 == 2048 && nei1 == 512;
 
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+
+    bool quantize_y = src0->type != GGML_TYPE_SIGN1 && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
     // Check for mmq first
     vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_id_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
@@ -9956,6 +10384,12 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     if (mmp == nullptr) {
         // Fall back to f16 dequant mul mat
         mmp = ggml_vk_get_mul_mat_mat_id_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
+        quantize_y = false;
+    }
+    if (sign1_bitplane_mmq) {
+
+        mmp = ggml_vk_get_mul_mat_mat_id_pipeline(ctx, GGML_TYPE_SIGN1, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]);
+
         quantize_y = false;
     }
 
@@ -9970,12 +10404,29 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // Not implemented
     GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
 
-    const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
+    const ggml_type effective_src1_type = (quantize_y || sign1_bitplane_mmq) ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, nei1, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
-    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
+    const uint32_t kpad = sign1_bitplane_mmq ? ne10 : (quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, nei1, qx_needs_dequant ? f16_type : src0->type, effective_src1_type)));
+    const bool aligned = !sign1_bitplane_mmq && !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, nei1, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+
+    vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, nei1, ne10, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+    const uint32_t output_type_index = dst->type == GGML_TYPE_F16 ? 1u : 0u;
+    if (sign1_bitplane_mmq && ne01 == 1024 && ne10 == 512) {
+        pipeline = ctx->device->pipeline_sign1_v_k512[output_type_index];
+    } else if (sign1_bitplane_mmq && ne01 == 1024 && ne10 == 2048) {
+        pipeline = sign1_prequant_scale
+            ? ctx->device->pipeline_sign1_v_k2048_expert_major[output_type_index]
+            : ctx->device->pipeline_sign1_v_k2048[output_type_index];
+    } else if (sign1_bitplane_mmq && ne10 == 1024) {
+        if (ne01 == 512) {
+            pipeline = ctx->device->pipeline_sign1_u512;
+        } else if (ne01 == 2048) {
+            pipeline = ctx->device->pipeline_sign1_u2048;
+        }
+    }
+
+
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -9987,15 +10438,35 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const uint64_t d_ne = ggml_nelements(dst);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
-    const uint64_t qy_sz = ggml_type_size(src1->type) * ggml_nelements(src1) / ggml_blck_size(src1->type);
+    const uint64_t qy_sz = ggml_type_size(src1_data->type) * ggml_nelements(src1_data) / ggml_blck_size(src1_data->type);
     const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
-    const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
+    const uint64_t bitplane_vectors = y_ne / ne10;
+    const uint64_t bitplane_words = CEIL_DIV(ne10, 32);
+    const uint64_t bitplane_y_sz = bitplane_vectors * (2 + 8 * bitplane_words) * sizeof(uint32_t);
+    const uint64_t y_sz = sign1_bitplane_mmq ? bitplane_y_sz :
+        (quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) :
+         (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne));
     const uint64_t ids_sz = nbi2;
-    const uint64_t d_sz = sizeof(float) * d_ne;
+    const uint64_t d_sz = ggml_type_size(dst->type) * d_ne / ggml_blck_size(dst->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
     vk_pipeline to_q8_1 = nullptr;
+    const uint32_t input_type_index = src1_data->type == GGML_TYPE_F16 ? 1u : 0u;
+    const bool sign1_expert_major_input = sign1_bitplane_mmq &&
+        (sign1_prequant_scale ||
+         (ne10 == 1024 && src1->type == GGML_TYPE_F16) ||
+         (ne10 == 512 && src1->type == GGML_TYPE_F32));
+    vk_pipeline to_bitplane = sign1_swiglu_y
+        ? ctx->device->pipeline_quantize_sign1_bitplane_mmq_swiglu_scaled
+        : sign1_prequant_scale
+        ? ctx->device->pipeline_quantize_sign1_bitplane_mmq_scaled
+        : sign1_expert_major_input
+        ? ctx->device->pipeline_quantize_sign1_bitplane_mmq_expert_major[input_type_index]
+        : sign1_bitplane_mmq
+            ? ctx->device->pipeline_quantize_sign1_bitplane_mmq[
+                ggml_vk_sign1_quant_pipeline_index((uint32_t) ne10)][input_type_index]
+            : nullptr;
 
     auto make_y_staged_dst = [&]() {
         ggml_tensor y_staged_dst = *src1;
@@ -10032,7 +10503,12 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
     vk_pipeline count_experts = ctx->device->pipeline_count_experts;
 
-    uint32_t expert_count_size = sizeof(uint32_t) * n_as;
+    const uint32_t expert_count_size = sizeof(uint32_t) * n_as;
+    const uint32_t compact_rows_offset = ggml_vk_align_size(expert_count_size, 256);
+    const uint32_t compact_rows_size = sign1_precompact
+        ? sizeof(uint32_t) * (n_as * (nei1 + 1) + nei0 * nei1)
+        : 0;
+    const uint32_t routing_scratch_size = compact_rows_offset + compact_rows_size;
 
     {
         if (
@@ -10044,17 +10520,27 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             ctx->prealloc_size_x = x_sz;
             ggml_vk_preallocate_buffers(ctx, subctx);
         }
-        if ((qy_needs_dequant || quantize_y) && ctx->prealloc_size_y < y_sz) {
+        if ((qy_needs_dequant || quantize_y || sign1_bitplane_mmq) && ctx->prealloc_size_y < y_sz) {
             ctx->prealloc_size_y = y_sz;
             ggml_vk_preallocate_buffers(ctx, subctx);
         }
-        if (ctx->prealloc_size_split_k < expert_count_size) {
-            ctx->prealloc_size_split_k = expert_count_size;
+        if (sign1_precompact && ctx->prealloc_size_sign1_routing < routing_scratch_size) {
+            ctx->prealloc_size_sign1_routing = routing_scratch_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (sign1_shared_y && ctx->prealloc_size_sign1_shared_y < y_sz) {
+            ctx->prealloc_size_sign1_shared_y = y_sz;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (!sign1_precompact && ctx->prealloc_size_split_k < routing_scratch_size) {
+            ctx->prealloc_size_split_k = routing_scratch_size;
             ggml_vk_preallocate_buffers(ctx, subctx);
         }
 
         // Request descriptor sets
+
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
         if (qx_needs_dequant) {
             ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_0, 1);
         }
@@ -10064,7 +10550,14 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         if (quantize_y) {
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
         }
+        if (sign1_bitplane_mmq) {
+            ggml_pipeline_request_descriptor_sets(ctx, to_bitplane, 1);
+        }
         ggml_pipeline_request_descriptor_sets(ctx, count_experts, 1);
+        if (sign1_precompact) {
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_compact_expert_rows, 1);
+        }
+
     }
 
     vk_buffer d_D = dst_buf_ctx->dev_buffer;
@@ -10081,7 +10574,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
     if (!src1_uma) {
         d_Qy = src1_buf_ctx->dev_buffer;
-        qy_buf_offset = vk_tensor_offset(src1) + src1->view_offs;
+        qy_buf_offset = vk_tensor_offset(src1_data) + src1_data->view_offs;
         GGML_ASSERT(d_Qy != nullptr);
     }
     if (!ids_uma) {
@@ -10103,6 +10596,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     } else if (quantize_y) {
         d_Y = ctx->prealloc_y;
         GGML_ASSERT(d_Y->size >= CEIL_DIV(y_sz, 144) * 144);
+    } else if (sign1_bitplane_mmq) {
+        d_Y = sign1_shared_y ? ctx->prealloc_sign1_shared_y : ctx->prealloc_y;
+        GGML_ASSERT(d_Y->size >= y_sz);
     } else {
         d_Y = d_Qy;
         y_buf_offset = qy_buf_offset;
@@ -10114,12 +10610,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             ggml_vk_sync_buffers(ctx, subctx);
         }
     }
-    // Count how many times each expert is used
-    vk_subbuffer expert_count_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
-    if (ctx->prealloc_split_k_need_sync) {
-        ggml_vk_sync_buffers(ctx, subctx);
-    }
-    {
+    // Build one graph-local routing plan and reuse it across gate/up/down V and U.
+    vk_buffer routing_buffer = sign1_precompact ? ctx->prealloc_sign1_routing : ctx->prealloc_split_k;
+    vk_subbuffer expert_count_buf = ggml_vk_subbuffer(ctx, routing_buffer, 0);
+    vk_subbuffer compact_rows_buf = sign1_precompact
+        ? ggml_vk_subbuffer(ctx, routing_buffer, compact_rows_offset)
+        : vk_subbuffer{};
+    const bool routing_cache_hit = sign1_reuse_routing &&
+        ctx->sign1_routing_last_ids == ids &&
+        ctx->sign1_routing_last_nei0 == (uint32_t) nei0 &&
+        ctx->sign1_routing_last_nei1 == (uint32_t) nei1 &&
+        ctx->sign1_routing_last_n_as == (uint32_t) n_as;
+    if (!routing_cache_hit) {
+        if (!sign1_precompact && ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
         const std::vector<uint32_t> pc = { (uint32_t)nei0,
                                            (uint32_t)nei1,
                                            (uint32_t)(nbi0 / ggml_type_size(ids->type)),
@@ -10127,6 +10632,23 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                            (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)) };
         ggml_vk_dispatch_pipeline(ctx, subctx, count_experts,
             { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc, { (uint32_t)n_as, 1, 1});
+        if (sign1_precompact) {
+            ggml_vk_sync_buffers(ctx, subctx);
+            const std::vector<uint32_t> compact_pc = {
+                (uint32_t)nei0,
+                (uint32_t)nei1,
+                (uint32_t)(nbi1 / ggml_type_size(ids->type)),
+                (uint32_t)n_as,
+            };
+            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_compact_expert_rows,
+                { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, compact_rows_buf, expert_count_buf }, compact_pc,
+                { 1, 1, (uint32_t)n_as });
+            ctx->sign1_routing_last_ids = ids;
+            ctx->sign1_routing_last_nei0 = (uint32_t) nei0;
+            ctx->sign1_routing_last_nei1 = (uint32_t) nei1;
+            ctx->sign1_routing_last_n_as = (uint32_t) n_as;
+        }
+        ggml_vk_sync_buffers(ctx, subctx);
     }
 
     if (x_non_contig) {
@@ -10161,6 +10683,48 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             ctx->prealloc_y_last_decode_vector_staging = y_decode_vector_staging;
         }
     }
+    if (sign1_bitplane_mmq) {
+        const bool shared_y_cache_hit = sign1_shared_y &&
+            ctx->sign1_shared_y_last_tensor == src1 &&
+            ctx->sign1_shared_y_last_vector_length == (uint32_t) ne10 &&
+            ctx->sign1_shared_y_last_vectors == (uint32_t) bitplane_vectors;
+        if (!shared_y_cache_hit) {
+            if (!sign1_shared_y && ctx->prealloc_y_need_sync) {
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+            if (sign1_swiglu_y) {
+                ggml_vk_quantize_sign1_bitplane_mmq_swiglu_scaled(
+                    ctx, subctx, to_bitplane,
+                    ggml_vk_tensor_subbuffer(ctx, src1_data->src[0]),
+                    ggml_vk_tensor_subbuffer(ctx, src1_data->src[1]),
+                    ggml_vk_subbuffer(ctx, d_Y, 0), compact_rows_buf,
+                    ggml_vk_tensor_subbuffer(ctx, prequant_scale),
+                    static_cast<uint32_t>(ne10), static_cast<uint32_t>(bitplane_vectors),
+                    static_cast<uint32_t>(ne11), static_cast<uint32_t>(n_as), static_cast<uint32_t>(nei1));
+            } else if (sign1_expert_major_input) {
+                ggml_vk_quantize_sign1_bitplane_mmq_expert_major(
+                    ctx, subctx, to_bitplane,
+                    ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0),
+                    compact_rows_buf,
+                    sign1_prequant_scale ? ggml_vk_tensor_subbuffer(ctx, prequant_scale) : vk_subbuffer{},
+                    static_cast<uint32_t>(ne10), static_cast<uint32_t>(bitplane_vectors),
+                    static_cast<uint32_t>(ne11), static_cast<uint32_t>(n_as), static_cast<uint32_t>(nei1));
+            } else {
+                ggml_vk_quantize_sign1_bitplane_mmq(ctx, subctx, to_bitplane,
+                    ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0),
+                    static_cast<uint32_t>(ne10), static_cast<uint32_t>(bitplane_vectors));
+            }
+            if (sign1_shared_y) {
+                ctx->sign1_shared_y_last_tensor = src1;
+                ctx->sign1_shared_y_last_vector_length = (uint32_t) ne10;
+                ctx->sign1_shared_y_last_vectors = (uint32_t) bitplane_vectors;
+            } else {
+                ctx->prealloc_y_last_pipeline_used = to_bitplane.get();
+                ctx->prealloc_y_last_tensor_used = src1;
+                ctx->prealloc_y_last_decode_vector_staging = false;
+            }
+        }
+    }
     if (quantize_y) {
         if (ctx->prealloc_y_last_pipeline_used != to_q8_1.get() ||
             ctx->prealloc_y_last_tensor_used != src1 ||
@@ -10192,19 +10756,25 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     ggml_vk_matmul_id(
         ctx, subctx, pipeline,
         { d_X, x_buf_offset, x_sz }, { d_Y, y_buf_offset, y_sz },
-        { d_D, d_buf_offset, d_sz }, { d_ids, ids_buf_offset, ids_sz }, expert_count_buf,
-        ne01, ne21, ne10, ne10, stride_b_y, ne01,
+        { d_D, d_buf_offset, d_sz },
+        sign1_precompact ? std::move(compact_rows_buf) : vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf,
+                dst->src[3] != nullptr ? ggml_vk_tensor_subbuffer(ctx, dst->src[3]) : vk_subbuffer{ d_D, d_buf_offset, d_sz },
+                ne01, ne21, ne10, ne10, stride_b_y, ne01,
         stride_batch_x, stride_batch_y, ne20*ne21,
-        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, padded_n
+        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11,
+        padded_n,
+        dst->src[3] != nullptr
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
         ctx->prealloc_x_need_sync = true;
     }
-    if (y_non_contig || quantize_y) {
+    if (y_non_contig || quantize_y || (sign1_bitplane_mmq && !sign1_shared_y)) {
         ctx->prealloc_y_need_sync = true;
     }
-    ctx->prealloc_split_k_need_sync = true;
+    if (!sign1_precompact) {
+        ctx->prealloc_split_k_need_sync = true;
+    }
 }
 
 static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -10212,6 +10782,17 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
     ggml_tensor * ids = dst->src[2];
+    ggml_tensor * fused_din = nullptr;
+    if (src0->type == GGML_TYPE_SIGN1 && (src0->ne[0] == 512 || src0->ne[0] == 2048) &&
+        dst->src[4] != nullptr && dst->src[5] != nullptr) {
+        fused_din = dst->src[4];
+        GGML_ASSERT(src1->op == GGML_OP_MUL_ROWS_ID);
+        GGML_ASSERT(src1->src[0] == dst->src[5]);
+        GGML_ASSERT(src1->src[1] == fused_din);
+        GGML_ASSERT(src1->src[2] == ids);
+        GGML_ASSERT(fused_din->type == GGML_TYPE_F16);
+        src1 = dst->src[5];
+    }
     VK_LOG_DEBUG("ggml_vk_mul_mat_vec_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
@@ -10240,11 +10821,33 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     // const uint64_t ne22 = dst->ne[2];
     // const uint64_t ne23 = dst->ne[3];
 
+    ggml_tensor * fused_dmid = nullptr;
+    if (src0->type == GGML_TYPE_SIGN1 && dst->src[3] != nullptr) {
+        fused_dmid = dst->src[3];
+        GGML_ASSERT(fused_dmid->type == GGML_TYPE_F16);
+        GGML_ASSERT(fused_dmid->ne[0] == dst->ne[0]);
+        GGML_ASSERT(fused_dmid->ne[1] == src0->ne[2]);
+    }
+
+    const bool dbdbd_v2048 = fused_din != nullptr && fused_dmid != nullptr && ne00 == 2048 && ne01 == 1024;
+    const bool dbdbd_v512  = fused_din == nullptr && fused_dmid != nullptr && ne00 == 512  && ne01 == 1024;
+    const bool dbdbd_u512  = fused_din == nullptr && fused_dmid != nullptr && ne00 == 1024 && ne01 == 512;
+    const bool dbdbd_u2048 = fused_din == nullptr && fused_dmid != nullptr && ne00 == 1024 && ne01 == 2048;
+    const bool dbdbd_static = dbdbd_v2048 || dbdbd_v512 || dbdbd_u512 || dbdbd_u2048;
+
+    if (dbdbd_v2048 || dbdbd_v512 || dbdbd_u512) {
+        GGML_ASSERT(ctx->num_additional_fused_ops == 0);
+    }
+    if (dbdbd_u2048) {
+        GGML_ASSERT(ctx->num_additional_fused_ops == 1);
+        GGML_ASSERT(cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL);
+    }
+
     const bool x_non_contig = !ggml_vk_dim01_contiguous(src0);
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type);
+    bool quantize_y = !dbdbd_static && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -10257,12 +10860,20 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
     }
 
-    // Check for mmq first
-    vk_pipeline dmmv = quantize_y ? ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, GGML_TYPE_Q8_1, ne20, ne00) : nullptr;
+    vk_pipeline dmmv = nullptr;
+    if (dbdbd_v2048) {
+        dmmv = ctx->device->pipeline_sign1_k2048_rows4;
+    } else if (dbdbd_v512) {
+        dmmv = ctx->device->pipeline_sign1_rows8;
+    } else if (dbdbd_u512 || dbdbd_u2048) {
+        dmmv = ctx->device->pipeline_sign1_rows4;
+    } else if (quantize_y) {
+        dmmv = ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, GGML_TYPE_Q8_1, ne20, ne00);
+    }
     vk_pipeline to_q8_1 = nullptr;
 
     if (dmmv == nullptr) {
-        // Fall back to f16 dequant mul mat
+        // Fall back to the general routed matvec path for non-DBDBD roles.
         dmmv = ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, src1->type, ne20, ne00);
         quantize_y = false;
     }
@@ -10320,11 +10931,22 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         ggml_pipeline_request_descriptor_sets(ctx, dmmv, nei1);
     }
 
+    if (src0->type == GGML_TYPE_SIGN1) {
+        if (src0->ne[0] == 2048) {
+            GGML_ASSERT((dst->ne[0] % 2) == 0);
+        } else if (src0->ne[0] == 1024) {
+            GGML_ASSERT((dst->ne[0] % 4) == 0);
+        } else if (src0->ne[0] == 512) {
+            GGML_ASSERT((dst->ne[0] % 8) == 0);
+        }
+    }
+
     vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
     vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
     vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1);
     vk_subbuffer d_ids = ggml_vk_tensor_subbuffer(ctx, ids);
-    vk_subbuffer d_F0 = d_D;
+    vk_subbuffer d_F0 = fused_dmid != nullptr ? ggml_vk_tensor_subbuffer(ctx, fused_dmid) : d_D;
+    vk_subbuffer d_F1 = fused_din != nullptr ? ggml_vk_tensor_subbuffer(ctx, fused_din) : d_D;
     vk_subbuffer d_X, d_Y;
 
     if (qx_needs_dequant) {
@@ -10392,23 +11014,33 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         groups_x = CEIL_DIV(groups_x, groups_z);
     }
 
-    uint32_t fusion_flags = 0;
+    uint32_t fusion_flags = fused_dmid != nullptr ? MAT_VEC_FUSION_FLAGS_SCALE_ROWS_ID : 0;
+    if (fused_din != nullptr) {
+        GGML_ASSERT(ctx->num_additional_fused_ops == 0);
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_INPUT_SCALE_ROWS_ID;
+    }
 
     if (ctx->num_additional_fused_ops > 0) {
         const ggml_tensor * bias = cgraph->nodes[node_idx + 1]->src[1];
 
-        d_F0 = ggml_vk_tensor_subbuffer(ctx, bias);
-
-        if (cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL) {
-            fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE0;
+        if (fused_dmid != nullptr) {
+            GGML_ASSERT(ctx->num_additional_fused_ops == 1);
+            GGML_ASSERT(cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL);
+            d_F1 = ggml_vk_tensor_subbuffer(ctx, bias);
+            fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
         } else {
-            GGML_ASSERT(cgraph->nodes[node_idx + 1]->op == GGML_OP_ADD_ID);
-            fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS0;
+            d_F0 = ggml_vk_tensor_subbuffer(ctx, bias);
+            if (cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL) {
+                fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE0;
+            } else {
+                GGML_ASSERT(cgraph->nodes[node_idx + 1]->op == GGML_OP_ADD_ID);
+                fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS0;
+            }
         }
     }
 
-    vk_subbuffer d_F1 = d_D;
     if (ctx->num_additional_fused_ops > 1) {
+        GGML_ASSERT(fused_dmid == nullptr);
         const ggml_tensor * scale = cgraph->nodes[node_idx + 2]->src[1];
 
         d_F1 = ggml_vk_tensor_subbuffer(ctx, scale);
@@ -10446,7 +11078,20 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
+    ggml_tensor * src1 = dst->src[1];
     ggml_tensor * src2 = dst->src[2];
+    // The vector-ID shader family has no quantized-A × FP16-RHS variant.
+    // Use the real mat-mat-ID SIGN1×FP16 pipeline, which supports N=1 too.
+    if (src0->type == GGML_TYPE_SIGN1) {
+        if (src1->type == GGML_TYPE_F16) {
+            return false;
+        }
+        // Generation and tiny routed batches use the repack-aware vector-ID kernels.
+        // Larger batches use the repack-aware routed MMQ path, which also consumes
+        // the optional graph-level dmid scaler from dst->src[3].
+        const bool supported_mmq_k = src1->ne[0] == 2048 || src1->ne[0] == 1024 || src1->ne[0] == 512;
+        return src2->ne[1] <= 8 || !supported_mmq_k;
+    }
     return (src2->ne[1] <= 8) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
 }
 
@@ -10972,6 +11617,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_OUT_PROD:
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_out_prod_f32;
+        }
+        return nullptr;
+    case GGML_OP_MUL_ROWS_ID:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && src2->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_mul_rows_id_f32_f16;
         }
         return nullptr;
     case GGML_OP_CONCAT: {
@@ -11709,7 +12359,7 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
 }
 
 template<typename PC>
-static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst, ggml_op op, PC&& pc) {
+static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst, ggml_op op, PC&& pc, vk_pipeline pipeline_override = nullptr) {
     VK_LOG_DEBUG("ggml_vk_op_f32((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     if (src1 != nullptr) {
         std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -11723,6 +12373,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << dst->type << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
     std::cerr << "), " << ggml_op_name(op) << ")");
     GGML_ASSERT(op == GGML_OP_GET_ROWS || op == GGML_OP_CPY || op == GGML_OP_CONCAT || (!ggml_is_quantized(src0->type) && (src1 == nullptr || !ggml_is_quantized(src1->type))));  // NOLINT
+    GGML_ASSERT(op == GGML_OP_GET_ROWS || op == GGML_OP_MUL_ROWS_ID || op == GGML_OP_CPY || (!ggml_is_quantized(src0->type) && (src1 == nullptr || !ggml_is_quantized(src1->type))));
     GGML_ASSERT(dst->buffer != nullptr);
     const uint64_t ne00 = src0->ne[0];
     const uint64_t ne01 = src0->ne[1];
@@ -11740,7 +12391,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
     init_pushconst_fastdiv(pc);
 
-    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, src0, src1, src2, dst, op);
+    vk_pipeline pipeline = pipeline_override ? pipeline_override : ggml_vk_op_get_pipeline(ctx, src0, src1, src2, dst, op);
 
     if (pipeline == nullptr) {
         std::cerr << "ggml_vulkan: Error: Missing op: " << ggml_op_name(op) << " for " << ggml_type_name(src0->type);
@@ -11829,6 +12480,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             elements = { nrows, (uint32_t)ne00, z };
 
         } break;
+    case GGML_OP_MUL_ROWS_ID:
+        elements = { (uint32_t)ggml_nelements(dst), 1, 1 };
+        break;
     case GGML_OP_GET_ROWS:
         elements = { (uint32_t)ne00, (uint32_t)ne10, (uint32_t)(ne11 * ne12) };
         elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
@@ -12056,9 +12710,14 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
             { src0_buf, src1_buf, dst_buf, a_buf }, pc, elements);
     } else if (op == GGML_OP_GLU) {
-        // Empty src1 is possible in glu, but the shader needs a buffer
+        // Empty src1 is possible in glu, but the shader needs a buffer.
+        // The routed-scale fusion additionally binds scale and expert IDs.
         vk_subbuffer subbuf1 = use_src1 ? src1_buf : src0_buf;
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, subbuf1, dst_buf }, pc, elements);
+        if (use_src3) {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, subbuf1, src2_buf, src3_buf, dst_buf }, pc, elements);
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, subbuf1, dst_buf }, pc, elements);
+        }
     } else if (op == GGML_OP_SOFT_MAX) {
         // Empty src1 and src2 is possible in soft_max, but the shader needs a buffer
         vk_subbuffer subbuf1 = use_src1 ? src1_buf : src0_buf;
@@ -12342,6 +13001,16 @@ static void ggml_vk_add_id(ggml_backend_vk_context * ctx, vk_context& subctx, co
         (uint32_t)src0->nb[2] / src0_type_size,
         (uint32_t)src1->nb[1] / src1_type_size,
         (uint32_t)src2->nb[1] / src2_type_size,
+    });
+}
+
+static void ggml_vk_mul_rows_id(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
+    ggml_vk_op_f32<vk_op_mul_rows_id_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_MUL_ROWS_ID, {
+        (uint32_t)dst->ne[0], (uint32_t)src2->ne[0], (uint32_t)src2->ne[1], (uint32_t)src0->ne[1],
+        (uint32_t)(src0->nb[1] / sizeof(float)), (uint32_t)(src0->nb[2] / sizeof(float)),
+        (uint32_t)(src1->nb[1] / sizeof(uint16_t)),
+        (uint32_t)(src2->nb[0] / sizeof(int32_t)), (uint32_t)(src2->nb[1] / sizeof(int32_t)),
+        (uint32_t)(dst->nb[1] / sizeof(float)), (uint32_t)(dst->nb[2] / sizeof(float)),
     });
 }
 
@@ -13083,10 +13752,18 @@ static void ggml_vk_xielu(ggml_backend_vk_context * ctx, vk_context& subctx, con
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_UNARY, std::move(p));
 }
 
-static void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const float * op_params_f = (const float *)dst->op_params;
+static void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * glu = cgraph->nodes[node_idx];
+    const ggml_tensor * src0 = glu->src[0];
+    const ggml_tensor * src1 = glu->src[1];
+    const bool fused_rows_id = ctx->num_additional_fused_ops == 1 &&
+        cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL_ROWS_ID;
+    ggml_tensor * dst = fused_rows_id ? cgraph->nodes[node_idx + 1] : cgraph->nodes[node_idx];
+    const ggml_tensor * scale = fused_rows_id ? dst->src[1] : nullptr;
+    const ggml_tensor * ids = fused_rows_id ? dst->src[2] : nullptr;
+    const float * op_params_f = (const float *)glu->op_params;
 
-    const bool swapped = (bool)dst->op_params[1];
+    const bool swapped = (bool)glu->op_params[1];
     const bool split = src1 != nullptr;
     const float alpha = op_params_f[2];
     const float limit = op_params_f[3];
@@ -13098,13 +13775,22 @@ static void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const
         GGML_ASSERT(src0->ne[0] == dst->ne[0]);
         GGML_ASSERT(src0->type == src1->type);
     }
+    if (fused_rows_id) {
+        GGML_ASSERT(dst->src[0] == glu);
+        GGML_ASSERT(scale->type == GGML_TYPE_F16);
+        GGML_ASSERT(ids->type == GGML_TYPE_I32);
+        GGML_ASSERT(scale->ne[0] == dst->ne[0]);
+    }
 
     const uint32_t mode = split ? 2 : (swapped ? 1 : 0);
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = split ? ggml_type_size(src1->type) : src0_type_size;
     const uint32_t dst_type_size  = ggml_type_size(dst->type);
+    const vk_pipeline pipeline = fused_rows_id
+        ? ctx->device->pipeline_swiglu_rows_id[dst->type == GGML_TYPE_F16]
+        : nullptr;
 
-    ggml_vk_op_f32<vk_op_glu_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GLU,
+    ggml_vk_op_f32<vk_op_glu_push_constants>(ctx, subctx, src0, src1, scale, ids, dst, GGML_OP_GLU,
         {
             (uint32_t)ggml_nelements(dst),
             (uint32_t)src0->ne[0],
@@ -13128,7 +13814,11 @@ static void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const
             (uint32_t)dst->ne[2],
             0,
             0, 0, 0, 0, 0, 0,
-        });
+            (uint32_t)dst->ne[1],
+            (uint32_t)dst->ne[2],
+            ids ? (uint32_t)ids->ne[0] : 0,
+            ids ? (uint32_t)(ids->nb[1] / sizeof(int32_t)) : 0,
+        }, pipeline);
 }
 
 static void ggml_vk_diag_mask_inf(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -14929,6 +15619,22 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         ctx->prealloc_y_last_tensor_used = nullptr;
         ctx->prealloc_y_last_decode_vector_staging = false;
     }
+    if (ctx->prealloc_sign1_routing == nullptr || (ctx->prealloc_size_sign1_routing > 0 && ctx->prealloc_sign1_routing->size < ctx->prealloc_size_sign1_routing)) {
+        VK_LOG_MEMORY("ggml_vk_preallocate_buffers(sign1_routing_size: " << ctx->prealloc_size_sign1_routing << ")");
+        if (ctx->prealloc_sign1_routing != nullptr) {
+            ggml_vk_destroy_buffer(ctx->prealloc_sign1_routing);
+        }
+        ctx->prealloc_sign1_routing = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_sign1_routing);
+        ctx->sign1_routing_last_ids = nullptr;
+    }
+    if (ctx->prealloc_sign1_shared_y == nullptr || (ctx->prealloc_size_sign1_shared_y > 0 && ctx->prealloc_sign1_shared_y->size < ctx->prealloc_size_sign1_shared_y)) {
+        VK_LOG_MEMORY("ggml_vk_preallocate_buffers(sign1_shared_y_size: " << ctx->prealloc_size_sign1_shared_y << ")");
+        if (ctx->prealloc_sign1_shared_y != nullptr) {
+            ggml_vk_destroy_buffer(ctx->prealloc_sign1_shared_y);
+        }
+        ctx->prealloc_sign1_shared_y = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_sign1_shared_y);
+        ctx->sign1_shared_y_last_tensor = nullptr;
+    }
     if (ctx->prealloc_split_k == nullptr || (ctx->prealloc_size_split_k > 0 && ctx->prealloc_split_k->size < ctx->prealloc_size_split_k)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(split_k_size: " << ctx->prealloc_size_split_k << ")");
         // Resize buffer
@@ -14958,6 +15664,31 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     }
     if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
         return false;
+    }
+
+    if (node == ctx->sign1_swiglu_precomputed_scaled ||
+        node == ctx->sign1_swiglu_precomputed_down_v) {
+        return false;
+    }
+
+    ggml_tensor * sign1_swiglu_scaled = nullptr;
+    ggml_tensor * sign1_swiglu_down_v = nullptr;
+    if (node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU &&
+        node->src[1] != nullptr && node->ne[2] > 8) {
+        for (int i = node_idx + 1; i < cgraph->n_nodes; ++i) {
+            ggml_tensor * candidate = cgraph->nodes[i];
+            if (sign1_swiglu_scaled == nullptr && candidate->op == GGML_OP_MUL_ROWS_ID && candidate->src[0] == node) {
+                sign1_swiglu_scaled = candidate;
+                continue;
+            }
+            if (sign1_swiglu_scaled != nullptr && candidate->op == GGML_OP_MUL_MAT_ID &&
+                candidate->src[0] != nullptr && candidate->src[0]->type == GGML_TYPE_SIGN1 &&
+                candidate->src[0]->ne[0] == 512 && candidate->src[1] == sign1_swiglu_scaled &&
+                candidate->src[2] != nullptr && candidate->src[2]->ne[1] > 8 && candidate->src[5] == node) {
+                sign1_swiglu_down_v = candidate;
+                break;
+            }
+        }
     }
 
     VK_LOG_DEBUG("ggml_vk_build_graph(" << node << ", " << ggml_op_name(node->op) << ")");
@@ -15022,6 +15753,28 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             return false;
         };
 
+        // A fused SIGN1 input scaler leaves the logical MUL_ROWS_ID tensor in the
+        // graph for backend portability, but this backend reads src[5] plus src[4]
+        // directly and never reads src[1]. Do not create false dependencies on the
+        // skipped tensor's allocator storage.
+        const auto is_skipped_sign1_scaled_input = [](const ggml_tensor * cur_node, uint32_t src_idx) -> bool {
+            if (cur_node->op != GGML_OP_MUL_MAT_ID ||
+                !cur_node->src[0] || cur_node->src[0]->type != GGML_TYPE_SIGN1) {
+                return false;
+            }
+            if (src_idx == 5 && cur_node->src[5] && cur_node->src[5]->op == GGML_OP_GLU &&
+                cur_node->src[5]->src[0] && cur_node->src[5]->src[1] &&
+                cur_node->src[2] && cur_node->src[2]->ne[1] > 8) {
+                return true;
+            }
+            return src_idx == 1 &&
+                   cur_node->src[1] && cur_node->src[1]->op == GGML_OP_MUL_ROWS_ID &&
+                   cur_node->src[2] && cur_node->src[4] && cur_node->src[5] &&
+                   cur_node->src[1]->src[0] == cur_node->src[5] &&
+                   cur_node->src[1]->src[1] == cur_node->src[4] &&
+                   cur_node->src[1]->src[2] == cur_node->src[2];
+        };
+
         // For all fused ops, check if the destination node or any of the source
         // nodes require synchronization.
         for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1 && !need_sync; ++i) {
@@ -15034,7 +15787,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                 }
             }
             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
-                if (!cur_node->src[j]) {
+                if (!cur_node->src[j] || is_skipped_sign1_scaled_input(cur_node, j)) {
                     continue;
                 }
                 if (overlaps_unsynced(cur_node->src[j], ctx->unsynced_nodes_written)) {
@@ -15066,13 +15819,38 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                 ctx->unsynced_nodes_written.push_back(cur_node);
             }
             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
-                if (!cur_node->src[j]) {
+                if (!cur_node->src[j] || is_skipped_sign1_scaled_input(cur_node, j)) {
                     continue;
                 }
                 ctx->unsynced_nodes_read.push_back(cur_node->src[j]);
             }
         }
     }
+
+    if (sign1_swiglu_down_v != nullptr) {
+        GGML_ASSERT(sign1_swiglu_scaled != nullptr);
+        GGML_ASSERT(ctx->num_additional_fused_ops == 0);
+        // Execute the fused row encoding and down-V matmul while the gate/up
+        // source buffers are still live at the SwiGLU node.
+        ggml_vk_sync_buffers(ctx, compute_ctx);
+        ggml_vk_mul_mat_id_q_f16(
+            ctx, compute_ctx,
+            sign1_swiglu_down_v->src[0], sign1_swiglu_down_v->src[1],
+            sign1_swiglu_down_v->src[2], sign1_swiglu_down_v);
+        ctx->sign1_swiglu_precomputed_scaled = sign1_swiglu_scaled;
+        ctx->sign1_swiglu_precomputed_down_v = sign1_swiglu_down_v;
+        ctx->unsynced_nodes_written.push_back(sign1_swiglu_down_v);
+        ctx->tensor_ctxs[node_idx] = compute_ctx;
+
+        if (submit || last_node) {
+            ggml_vk_ctx_end(compute_ctx);
+            compute_ctx->exit_tensor_idx = last_node ? node_idx_begin : -1;
+            ctx->compute_ctx.reset();
+            ggml_vk_compute_forward(ctx, cgraph, node_begin, node_idx_begin, almost_ready);
+        }
+        return true;
+    }
+
     if (vk_enable_sync_logger) {
         for (int i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
             auto *n = cgraph->nodes[node_idx + i];
@@ -15138,7 +15916,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_ADD_ID:
         ggml_vk_add_id(ctx, compute_ctx, src0, src1, src2, node);
-
+        break;
+    case GGML_OP_MUL_ROWS_ID:
+        ggml_vk_mul_rows_id(ctx, compute_ctx, src0, src1, src2, node);
         break;
     case GGML_OP_CONCAT:
         ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
@@ -15282,7 +16062,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         case GGML_GLU_OP_SWIGLU_OAI:
         case GGML_GLU_OP_GEGLU_ERF:
         case GGML_GLU_OP_GEGLU_QUICK:
-            ggml_vk_glu(ctx, compute_ctx, src0, src1, node);
+            ggml_vk_glu(ctx, compute_ctx, cgraph, node_idx);
             break;
         default:
             return false;
@@ -15529,6 +16309,10 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_y_last_pipeline_used = {};
     ctx->prealloc_y_last_tensor_used = nullptr;
     ctx->prealloc_y_last_decode_vector_staging = false;
+    ctx->sign1_routing_last_ids = nullptr;
+    ctx->sign1_shared_y_last_tensor = nullptr;
+    ctx->sign1_swiglu_precomputed_scaled = nullptr;
+    ctx->sign1_swiglu_precomputed_down_v = nullptr;
 
     ctx->unsynced_nodes_written.clear();
     ctx->unsynced_nodes_read.clear();
@@ -15575,6 +16359,8 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
+    ggml_vk_destroy_buffer(ctx->prealloc_sign1_routing);
+    ggml_vk_destroy_buffer(ctx->prealloc_sign1_shared_y);
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->sync_staging);
 
@@ -15585,6 +16371,8 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
+    ctx->prealloc_size_sign1_routing = 0;
+    ctx->prealloc_size_sign1_shared_y = 0;
 
     for (auto& event : ctx->gc.events) {
         ctx->device->device.destroyEvent(event);
@@ -15681,6 +16469,56 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
         return;
     }
 
+    const bool is_sign1_v = std::strstr(tensor->name, "_exps_v") != nullptr;
+    const bool is_sign1_u = std::strstr(tensor->name, "_exps_u") != nullptr;
+    const bool repack_sign1 = tensor->type == GGML_TYPE_SIGN1 && tensor->ne[2] > 1 &&
+        ((tensor->ne[0] == 1024 && (is_sign1_v || is_sign1_u)) ||
+         (tensor->ne[0] == 512  && is_sign1_v)) &&
+        offset == 0 && size == ggml_nbytes(tensor);
+    if (repack_sign1 && tensor->ne[0] == 1024) {
+        const uint64_t bytes_per_row = 128;
+        const uint64_t rows = tensor->ne[1];
+        const uint64_t channels = tensor->ne[2] * tensor->ne[3];
+        GGML_ASSERT((rows % 4) == 0);
+        const uint8_t * src = static_cast<const uint8_t *>(data);
+        std::vector<uint8_t> packed(size);
+        for (uint64_t channel = 0; channel < channels; ++channel) {
+            const uint64_t base = channel * rows * bytes_per_row;
+            for (uint64_t row = 0; row < rows; row += 4) {
+                for (uint64_t lane = 0; lane < 64; ++lane) {
+                    const uint64_t dst = base + (row / 4) * (4 * bytes_per_row) + lane * 8;
+                    for (uint64_t r = 0; r < 4; ++r) {
+                        packed[dst + 2*r + 0] = src[base + (row + r) * bytes_per_row + 2*lane + 0];
+                        packed[dst + 2*r + 1] = src[base + (row + r) * bytes_per_row + 2*lane + 1];
+                    }
+                }
+            }
+        }
+        ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs, packed.data(), size);
+        return;
+    }
+    if (repack_sign1 && tensor->ne[0] == 512) {
+        const uint64_t bytes_per_row = 64;
+        const uint64_t rows = tensor->ne[1];
+        const uint64_t channels = tensor->ne[2] * tensor->ne[3];
+        GGML_ASSERT((rows % 8) == 0);
+        const uint8_t * src = static_cast<const uint8_t *>(data);
+        std::vector<uint8_t> packed(size);
+        for (uint64_t channel = 0; channel < channels; ++channel) {
+            const uint64_t base = channel * rows * bytes_per_row;
+            for (uint64_t row = 0; row < rows; row += 8) {
+                for (uint64_t lane = 0; lane < 64; ++lane) {
+                    const uint64_t dst = base + (row / 8) * (8 * bytes_per_row) + lane * 8;
+                    for (uint64_t r = 0; r < 8; ++r) {
+                        packed[dst + r] = src[base + (row + r) * bytes_per_row + lane];
+                    }
+                }
+            }
+        }
+        ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs, packed.data(), size);
+        return;
+    }
+
     ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
 
@@ -15707,6 +16545,56 @@ static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, cons
     }
 
     vk_buffer buf = buf_ctx->dev_buffer;
+
+    const bool is_sign1_v = std::strstr(tensor->name, "_exps_v") != nullptr;
+    const bool is_sign1_u = std::strstr(tensor->name, "_exps_u") != nullptr;
+    const bool repacked_sign1 = tensor->type == GGML_TYPE_SIGN1 && tensor->ne[2] > 1 &&
+        ((tensor->ne[0] == 1024 && (is_sign1_v || is_sign1_u)) ||
+         (tensor->ne[0] == 512  && is_sign1_v)) &&
+        offset == 0 && size == ggml_nbytes(tensor);
+    if (repacked_sign1 && tensor->ne[0] == 1024) {
+        const uint64_t bytes_per_row = 128;
+        const uint64_t rows = tensor->ne[1];
+        const uint64_t channels = tensor->ne[2] * tensor->ne[3];
+        std::vector<uint8_t> packed(size);
+        std::vector<uint8_t> canonical(size);
+        ggml_vk_buffer_read(buf, vk_tensor_offset(tensor) + tensor->view_offs, packed.data(), size);
+        for (uint64_t channel = 0; channel < channels; ++channel) {
+            const uint64_t base = channel * rows * bytes_per_row;
+            for (uint64_t row = 0; row < rows; row += 4) {
+                for (uint64_t lane = 0; lane < 64; ++lane) {
+                    const uint64_t src = base + (row / 4) * (4 * bytes_per_row) + lane * 8;
+                    for (uint64_t r = 0; r < 4; ++r) {
+                        canonical[base + (row + r) * bytes_per_row + 2*lane + 0] = packed[src + 2*r + 0];
+                        canonical[base + (row + r) * bytes_per_row + 2*lane + 1] = packed[src + 2*r + 1];
+                    }
+                }
+            }
+        }
+        std::memcpy(data, canonical.data(), size);
+        return;
+    }
+    if (repacked_sign1 && tensor->ne[0] == 512) {
+        const uint64_t bytes_per_row = 64;
+        const uint64_t rows = tensor->ne[1];
+        const uint64_t channels = tensor->ne[2] * tensor->ne[3];
+        std::vector<uint8_t> packed(size);
+        std::vector<uint8_t> canonical(size);
+        ggml_vk_buffer_read(buf, vk_tensor_offset(tensor) + tensor->view_offs, packed.data(), size);
+        for (uint64_t channel = 0; channel < channels; ++channel) {
+            const uint64_t base = channel * rows * bytes_per_row;
+            for (uint64_t row = 0; row < rows; row += 8) {
+                for (uint64_t lane = 0; lane < 64; ++lane) {
+                    const uint64_t src = base + (row / 8) * (8 * bytes_per_row) + lane * 8;
+                    for (uint64_t r = 0; r < 8; ++r) {
+                        canonical[base + (row + r) * bytes_per_row + lane] = packed[src + r];
+                    }
+                }
+            }
+        }
+        std::memcpy(data, canonical.data(), size);
+        return;
+    }
 
     ggml_vk_buffer_read(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
@@ -16765,6 +17653,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->prealloc_y_last_pipeline_used = nullptr;
     ctx->prealloc_y_last_tensor_used = nullptr;
     ctx->prealloc_y_last_decode_vector_staging = false;
+    ctx->sign1_routing_last_ids = nullptr;
+    ctx->sign1_shared_y_last_tensor = nullptr;
+    ctx->sign1_swiglu_precomputed_scaled = nullptr;
+    ctx->sign1_swiglu_precomputed_down_v = nullptr;
 
     if (ctx->prealloc_size_add_rms_partials) {
         ggml_vk_preallocate_buffers(ctx, nullptr);
@@ -16795,6 +17687,26 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        bool consumed_by_sign1_prequant = false;
+        if (node->op == GGML_OP_MUL_ROWS_ID) {
+            for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+                const ggml_tensor * consumer = cgraph->nodes[j];
+                if (consumer->op == GGML_OP_MUL_MAT_ID &&
+                    consumer->src[0]->type == GGML_TYPE_SIGN1 &&
+                    consumer->src[1] == node &&
+                    (consumer->src[2]->ne[1] > 8 || consumer->src[0]->ne[0] == 512 || consumer->src[0]->ne[0] == 2048) &&
+                    consumer->src[4] == node->src[1] &&
+                    consumer->src[5] == node->src[0]) {
+                    consumed_by_sign1_prequant = true;
+                    break;
+                }
+            }
+        }
+        if (consumed_by_sign1_prequant) {
+            continue;
+        }
+
         if (first_node_in_batch) {
             submit_node_idx = i;
         }
@@ -16831,13 +17743,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ADD";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
+            } else if (cgraph->nodes[i]->src[3] == nullptr &&
+                       ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ID_ADD_ID_MUL";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID })) {
+            } else if (cgraph->nodes[i]->src[3] == nullptr &&
+                       ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_MAT_ID_ADD_ID";
                 op_srcs_fused_elementwise[0] = false;
@@ -16846,6 +17760,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_MAT_ID_MUL";
                 op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+            } else if (cgraph->nodes[i]->op == GGML_OP_GLU &&
+                       cgraph->nodes[i]->src[1] != nullptr &&
+                       ggml_get_glu_op(cgraph->nodes[i]) == GGML_GLU_OP_SWIGLU &&
+                       ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_ROWS_ID }) &&
+                       cgraph->nodes[i + 1]->src[0] == cgraph->nodes[i] &&
+                       cgraph->nodes[i + 1]->src[1]->type == GGML_TYPE_F16 &&
+                       cgraph->nodes[i + 1]->src[2]->type == GGML_TYPE_I32 &&
+                       cgraph->nodes[i + 1]->src[2]->ne[1] <= 8) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "SWIGLU_MUL_ROWS_ID";
+                op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
             } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 4 }) &&
                        ggml_check_edges(cgraph, i, rms_norm_mul_rope_view_set_rows_edges) &&
@@ -17738,6 +18664,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
+        case GGML_TYPE_SIGN1:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -17807,7 +18734,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
                     return false;
                 }
-                auto fa_kv_ok = [](ggml_type t) {
+                auto fa_kv_ok = [coopmat2](ggml_type t) {
                     switch (t) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -17819,6 +18746,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_IQ4_NL:
                         return true;
+                    case GGML_TYPE_Q1_0:
+        case GGML_TYPE_SIGN1:
+                        return coopmat2;
                     default:
                         return false;
                     }
@@ -17835,6 +18765,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return true;
             }
+        case GGML_OP_MUL_ROWS_ID:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F16 &&
+                   op->src[2]->type == GGML_TYPE_I32;
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
@@ -17843,6 +18778,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
+        case GGML_TYPE_SIGN1:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -17884,6 +18820,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
+        case GGML_TYPE_SIGN1:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -17909,6 +18846,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
+        case GGML_TYPE_SIGN1:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -17926,6 +18864,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
+        case GGML_TYPE_SIGN1:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:

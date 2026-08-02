@@ -178,6 +178,46 @@ ACC_TYPE mmq_dot_product(const uint ib_a) {
 }
 #endif
 
+
+#if defined(DATA_A_SIGN1)
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+    // mul_mmq addresses A in 32-element chunks while SIGN1 stores 64 bits.
+    if (iqs == 0u) {
+        const block_sign1 block = data_a[ib >> 1u];
+        buf_a[buf_ib].bits = (ib & 1u) == 0u ? block.qs[0] : block.qs[1];
+    }
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].bits = buf_a[buf_ib].bits;
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    const uint32_t bits = cache_a[ib_a].bits;
+#if defined(DATA_B_F32)
+    float result = 0.0;
+    [[unroll]] for (uint i = 0u; i < 32u; ++i) {
+        const float x = buf_b[cache_b_index].x[i];
+        const uint sign_mask = ((bits >> i) & 1u) << 31u;
+        result += uintBitsToFloat(floatBitsToUint(x) ^ sign_mask);
+    }
+    return ACC_TYPE(result);
+#else
+    int32_t q_sum = 0;
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        const uint32_t bu = uint32_t(cache_b.qs[iqs]);
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            const uint lane = 4u * iqs + j;
+            int32_t bv = int32_t((bu >> (8u * j)) & 0xFFu);
+            if (bv >= 128) { bv -= 256; }
+            q_sum += ((bits >> lane) & 1u) != 0u ? -bv : bv;
+        }
+    }
+    return ACC_TYPE(float(q_sum) * float(cache_b.ds.x));
+#endif
+}
+#endif
+
 #if defined(DATA_A_MXFP4)
 // 1-byte loads for mxfp4 blocks (17 bytes)
 void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
@@ -455,6 +495,12 @@ ACC_TYPE mmq_dot_product(const uint ib_a) {
 #endif
 
 void block_b_to_shmem(const uint buf_ib, const uint ib, const uint iqs, const bool is_in_bounds) {
+#if defined(DATA_B_F32)
+    [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+        const uint value_index = iqs * 16u + j;
+        buf_b[buf_ib].x[value_index] = is_in_bounds ? data_b[ib * BK + value_index] : 0.0;
+    }
+#else
     if (is_in_bounds) {
         const uint ib_outer = ib / 4;
         const uint ib_inner = ib % 4;
@@ -478,11 +524,16 @@ void block_b_to_shmem(const uint buf_ib, const uint ib, const uint iqs, const bo
         buf_b[buf_ib].qs[iqs * 4 + 2] = 0;
         buf_b[buf_ib].qs[iqs * 4 + 3] = 0;
     }
+#endif
 }
 
 void block_b_to_registers(const uint ib) {
+#if defined(DATA_B_F32)
+    cache_b_index = ib;
+#else
     cache_b.ds = buf_b[ib].ds;
     [[unroll]] for (uint iqs = 0; iqs < BK / 4; iqs++) {
         cache_b.qs[iqs] = buf_b[ib].qs[iqs];
     }
+#endif
 }

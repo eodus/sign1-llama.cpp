@@ -8,6 +8,7 @@
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
 #include "traits.h"
+#include "quants.h"
 
 #include "arch-fallback.h"
 
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#include <type_traits>
 
 #include "repack.h"
 
@@ -338,6 +340,16 @@ template <> void ggml_quantize_mat_t<8, GGML_TYPE_Q8_K>(const float * GGML_RESTR
     UNUSED(nrow);
     ggml_quantize_mat_q8_K_4x8(x, vy, n_per_row);
 }
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+template <> void ggml_quantize_mat_t<8, GGML_TYPE_Q8_1>(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t nrow, int64_t n_per_row) {
+    assert(nrow == 4);
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q8_1, n_per_row);
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q8_1(x + row * n_per_row, (char *) vy + row * row_size, n_per_row);
+    }
+}
+#endif
 
 #if defined __riscv_zvfh
 template <> void ggml_quantize_mat_t<1, GGML_TYPE_Q8_0>(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t nrow, int64_t n_per_row) {
@@ -1022,6 +1034,42 @@ void ggml_gemv_q4_K_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
         }
         for (int j = 0; j < ncols_interleaved; j++) {
             s[x * ncols_interleaved + j] = sumf[j] - sum_minf[j];
+        }
+    }
+}
+
+void ggml_gemv_sign1_8x8_q8_1_generic(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    GGML_ASSERT(n % QK_SIGN1 == 0);
+    GGML_ASSERT(nr == 1);
+    GGML_ASSERT(nc % 8 == 0);
+    GGML_UNUSED(bs);
+
+    const int64_t nb = (int64_t) n / QK_SIGN1;
+    const block_sign1x8 * GGML_RESTRICT x = (const block_sign1x8 *) vx;
+    const block_q8_1 * GGML_RESTRICT y = (const block_q8_1 *) vy;
+
+    for (int64_t col = 0; col < (int64_t) nc; col += 8) {
+        const size_t tile_offset = (size_t) (col / 8) * (size_t) nb;
+        const block_sign1x8 * xb = x + tile_offset;
+        float sums[8] = {0};
+        for (int64_t ib = 0; ib < nb; ++ib) {
+            for (int r = 0; r < 8; ++r) {
+                const uint64_t bits = xb[ib].qs[r];
+                for (int half = 0; half < 2; ++half) {
+                    const size_t y_index = 2u * (size_t) ib + (size_t) half;
+                    const block_q8_1 & yb = y[y_index];
+                    int isum = 0;
+                    for (int j = 0; j < 32; ++j) {
+                        const int sign = ((bits >> (half * 32 + j)) & 1u) ? -1 : 1;
+                        isum += sign * yb.qs[j];
+                    }
+                    sums[r] += GGML_CPU_FP16_TO_FP32((ggml_half) (yb.data.ds & 0xffffu)) * isum;
+                }
+            }
+        }
+        for (int r = 0; r < 8; ++r) {
+            s[col + r] = sums[r];
         }
     }
 }
@@ -1980,6 +2028,19 @@ void ggml_gemm_q4_K_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
                 }
             }
         }
+    }
+}
+
+void ggml_gemm_sign1_8x8_q8_1_generic(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    GGML_ASSERT(n % QK_SIGN1 == 0);
+    GGML_ASSERT(nr % 4 == 0);
+    GGML_ASSERT(nc % 8 == 0);
+
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q8_1, n);
+    for (int64_t row = 0; row < (int64_t) nr; ++row) {
+        ggml_gemv_sign1_8x8_q8_1_generic(n, s + (size_t) row * bs, bs, vx,
+                (const char *) vy + (size_t) row * row_size, 1, nc);
     }
 }
 
@@ -3289,6 +3350,32 @@ static int repack_q4_K_to_q4_K_16_bl(struct ggml_tensor * t, int interleave_bloc
     GGML_UNUSED(data_size);
 }
 
+static int repack_sign1_to_sign1_8_bl(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_SIGN1);
+    constexpr int nrows_interleaved = 8;
+
+    block_sign1x8 * dst = (block_sign1x8 *) t->data;
+    const block_sign1 * src = (const block_sign1 *) data;
+    const int64_t nrow = ggml_nrows(t);
+    const int64_t nblocks = t->ne[0] / QK_SIGN1;
+
+    GGML_ASSERT(data_size == (size_t) nrow * (size_t) nblocks * sizeof(block_sign1));
+    if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % QK_SIGN1 != 0) {
+        return -1;
+    }
+
+    for (int64_t row = 0; row < nrow; row += nrows_interleaved) {
+        for (int64_t block = 0; block < nblocks; ++block) {
+            for (int64_t r = 0; r < nrows_interleaved; ++r) {
+                const size_t src_index = (size_t) (row + r) * (size_t) nblocks + (size_t) block;
+                dst->qs[r] = src[src_index].qs;
+            }
+            ++dst;
+        }
+    }
+    return 0;
+}
+
 static int repack_q2_K_to_q2_K_8_bl(struct ggml_tensor * t, int interleave_block, const void * GGML_RESTRICT data, size_t data_size) {
     GGML_ASSERT(t->type == GGML_TYPE_Q2_K);
     GGML_ASSERT(interleave_block == 8);
@@ -3885,6 +3972,12 @@ template <> int repack<block_q4_K, 4, 8>(struct ggml_tensor * t, const void * da
     return repack_q4_K_to_q4_K_8_bl(t, 4, data, data_size);
 }
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+template <> int repack<block_sign1, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_sign1_to_sign1_8_bl(t, data, data_size);
+}
+#endif
+
 template <> int repack<block_q2_K, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
     return repack_q2_K_to_q2_K_8_bl(t, 8, data, data_size);
 }
@@ -3971,6 +4064,12 @@ template <> void gemv<block_q4_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t
 template <> void gemv<block_q4_0, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemv_q4_0_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+template <> void gemv<block_sign1, 8, 8, GGML_TYPE_Q8_1>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_sign1_8x8_q8_1(n, s, bs, vx, vy, nr, nc);
+}
+#endif
 
 template <>
 void gemv<block_q2_K, 8, 8, GGML_TYPE_Q8_K>(int          n,
@@ -4076,6 +4175,12 @@ void gemm<block_q4_0, 8, 8, GGML_TYPE_Q8_0>(int          n,
     ggml_gemm_q4_0_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+template <> void gemm<block_sign1, 8, 8, GGML_TYPE_Q8_1>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_sign1_8x8_q8_1(n, s, bs, vx, vy, nr, nc);
+}
+#endif
+
 template <> void gemm<block_q2_K, 8, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_q2_K_8x8_q8_K(n, s, bs, vx, vy, nr, nc);
 }
@@ -4156,8 +4261,9 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
 };
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
+    static constexpr bool batch_mmid = std::is_same<BLOC_TYPE, block_sign1>::value && PARAM_TYPE == GGML_TYPE_Q8_1;
 
-    bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
+    bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
         // not realy a GGML_TYPE_Q8_0 but same size.
         switch (op->op) {
             case GGML_OP_MUL_MAT:
@@ -4167,15 +4273,30 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
             case GGML_OP_MUL_MAT_ID:
                 {
-                    size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
-                    size = GGML_PAD(size, sizeof(int64_t)); // + padding for next block.
-
                     const int64_t ne02 = op->src[0]->ne[2]; // n_as, n_expert
-                    const int64_t ne12 = op->src[1]->ne[2]; // n_tokens
-
+                    const int64_t ne12 = op->src[1]->ne[2];
                     const size_t sizeof_mmid_row_mapping = sizeof(int64_t);
 
-                    size += sizeof_mmid_row_mapping*ne02*(ne12 + 1);
+                    if constexpr (batch_mmid) {
+                        const int64_t n_tokens = op->src[2]->ne[1];
+                        const int64_t n_routed_rows = op->src[2]->ne[0] * n_tokens;
+                        const size_t quantized_row_size = ggml_row_size(PARAM_TYPE, op->src[1]->ne[0]);
+
+                        // The ordinary MMID path stores one quantized activation per source row.
+                        // Batched expert-major GEMM needs routed rows contiguous, so reserve one
+                        // compact quantized copy per selected expert/token pair.
+                        size = GGML_PAD(quantized_row_size * (size_t) n_routed_rows, sizeof(int64_t));
+                        size += sizeof(int64_t) * (size_t) ne02 * 2;
+                        size += sizeof_mmid_row_mapping * (size_t) ne02 * (size_t) n_tokens;
+                        size += (size_t) n_threads * 4 * (size_t) op->src[0]->ne[1] * sizeof(float);
+                        if (op->src[1]->type == GGML_TYPE_F16) {
+                            size += (size_t) n_threads * (size_t) op->src[1]->ne[0] * sizeof(float);
+                        }
+                    } else {
+                        size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
+                        size = GGML_PAD(size, sizeof(int64_t)); // + padding for next block.
+                        size += sizeof_mmid_row_mapping * (size_t) ne02 * ((size_t) ne12 + 1);
+                    }
 
                     return true;
                 }
@@ -4383,7 +4504,194 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         }
     }
 
+    void forward_mul_mat_id_batched(ggml_compute_params * params, ggml_tensor * op) {
+        static_assert(batch_mmid, "batched MMID is only instantiated for SIGN1/Q8_1");
+
+        const ggml_tensor * src0      = op->src[0];
+        const ggml_tensor * src1      = op->src[1];
+        const ggml_tensor * ids       = op->src[2];
+        const ggml_tensor * row_scale = op->src[3];
+        ggml_tensor * dst = op;
+
+        GGML_TENSOR_BINARY_OP_LOCALS
+
+        const int ith = params->ith;
+        const int nth = params->nth;
+        const int64_t n_ids = ids->ne[0];
+        const int64_t n_tokens = ids->ne[1];
+        const int64_t n_routed_rows = n_ids * n_tokens;
+        const int64_t n_as = ne02;
+        const size_t nbw1 = ggml_row_size(PARAM_TYPE, ne10);
+        const size_t qdata_size = GGML_PAD(nbw1 * (size_t) n_routed_rows, sizeof(int64_t));
+
+        struct mmid_row_mapping {
+            int32_t i1;
+            int32_t i2;
+        };
+        static_assert(sizeof(mmid_row_mapping) == sizeof(int64_t), "unexpected MMID row mapping size");
+
+        char * wdata = (char *) params->wdata;
+        int64_t * matrix_row_counts = (int64_t *) (wdata + qdata_size);
+        int64_t * matrix_row_offsets = matrix_row_counts + n_as;
+        mmid_row_mapping * matrix_rows = (mmid_row_mapping *) (matrix_row_offsets + n_as);
+        float * output_scratch = (float *) (matrix_rows + (size_t) n_as * (size_t) n_tokens);
+        float * thread_output = output_scratch + (size_t) ith * 4 * (size_t) ne01;
+        float * input_scratch = output_scratch + (size_t) nth * 4 * (size_t) ne01;
+        float * thread_input = input_scratch + (size_t) ith * (size_t) ne10;
+
+        const size_t required_size = qdata_size
+                + sizeof(int64_t) * (size_t) n_as * 2
+                + sizeof(mmid_row_mapping) * (size_t) n_as * (size_t) n_tokens
+                + (size_t) nth * 4 * (size_t) ne01 * sizeof(float)
+                + (src1->type == GGML_TYPE_F16 ? (size_t) nth * (size_t) ne10 * sizeof(float) : 0);
+        GGML_ASSERT(params->wsize >= required_size);
+        GGML_ASSERT(nb00 == ggml_type_size(src0->type));
+        GGML_ASSERT(nb10 == ggml_type_size(src1->type));
+        GGML_ASSERT(nb0 == ggml_type_size(dst->type));
+        GGML_ASSERT(ne03 == 1 && ne13 == 1 && ne3 == 1);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+        GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+        GGML_ASSERT(row_scale == nullptr || row_scale->type == GGML_TYPE_F16);
+        GGML_ASSERT(row_scale == nullptr || (row_scale->ne[0] == ne01 && row_scale->ne[1] == n_as));
+
+#define MMID_BATCHED_ROW(expert, row) matrix_rows[(size_t) (expert) * (size_t) n_tokens + (size_t) (row)]
+
+        // Build an expert-major row map and compact offsets once. Top-k IDs are unique per
+        // token, so one expert receives at most n_tokens rows and the fixed mapping slab is safe.
+        if (ith == 0) {
+            memset(matrix_row_counts, 0, (size_t) n_as * sizeof(int64_t));
+            for (int32_t token = 0; token < n_tokens; ++token) {
+                for (int32_t slot = 0; slot < n_ids; ++slot) {
+                    const int32_t expert = *(const int32_t *) ((const char *) ids->data
+                            + (size_t) token * ids->nb[1] + (size_t) slot * ids->nb[0]);
+                    GGML_ASSERT(expert >= 0 && expert < n_as);
+                    GGML_ASSERT(matrix_row_counts[expert] < n_tokens);
+                    MMID_BATCHED_ROW(expert, matrix_row_counts[expert]++) = { slot, token };
+                }
+            }
+
+            int64_t offset = 0;
+            for (int expert = 0; expert < n_as; ++expert) {
+                matrix_row_offsets[expert] = offset;
+                offset += matrix_row_counts[expert];
+            }
+            GGML_ASSERT(offset == n_routed_rows);
+        }
+        ggml_barrier(params->threadpool);
+
+        // Quantize directly into compact expert-major groups. This avoids copying each group
+        // independently in every worker before the four-input kernel call.
+        const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
+        for (int expert = 0; expert < n_as; ++expert) {
+            const int64_t count = matrix_row_counts[expert];
+            const int64_t offset = matrix_row_offsets[expert];
+            for (int64_t row = ith; row < count; row += nth) {
+                const mmid_row_mapping mapping = MMID_BATCHED_ROW(expert, row);
+                const int64_t source_plane = mapping.i1 % ne11;
+                const void * source = (const char *) src1->data
+                        + (size_t) mapping.i2 * nb12 + (size_t) source_plane * nb11;
+                const float * source_f32 = (const float *) source;
+                if (src1->type == GGML_TYPE_F16) {
+                    const ggml_fp16_t * source_f16 = (const ggml_fp16_t *) source;
+                    for (int64_t i = 0; i < ne10; ++i) {
+                        thread_input[i] = GGML_FP16_TO_FP32(source_f16[i]);
+                    }
+                    source_f32 = thread_input;
+                }
+                void * target = wdata + (size_t) (offset + row) * nbw1;
+                from_float(source_f32, target, ne10);
+            }
+        }
+        ggml_barrier(params->threadpool);
+
+        auto store_output = [&](mmid_row_mapping mapping, int expert, int64_t col_begin,
+                                const float * source, int64_t count) {
+            char * target_row = (char *) dst->data
+                    + (size_t) mapping.i1 * nb1 + (size_t) mapping.i2 * nb2;
+            const ggml_fp16_t * scales = row_scale == nullptr ? nullptr :
+                    (const ggml_fp16_t *) ((const char *) row_scale->data + (size_t) expert * row_scale->nb[1]);
+            if (dst->type == GGML_TYPE_F32) {
+                float * target = (float *) target_row + col_begin;
+                if (scales == nullptr) {
+                    memcpy(target, source, (size_t) count * sizeof(float));
+                } else {
+                    for (int64_t i = 0; i < count; ++i) {
+                        target[i] = source[i] * GGML_FP16_TO_FP32(scales[col_begin + i]);
+                    }
+                }
+            } else {
+                ggml_fp16_t * target = (ggml_fp16_t *) target_row + col_begin;
+                for (int64_t i = 0; i < count; ++i) {
+                    const float scale = scales == nullptr ? 1.0f : GGML_FP16_TO_FP32(scales[col_begin + i]);
+                    target[i] = GGML_FP32_TO_FP16(source[i] * scale);
+                }
+            }
+        };
+
+        for (int expert = 0; expert < n_as; ++expert) {
+            const int64_t count = matrix_row_counts[expert];
+            if (count == 0) {
+                continue;
+            }
+
+            int64_t col_begin = (ith * ne01) / nth;
+            int64_t col_end = ((ith + 1) * ne01) / nth;
+            col_begin = ((col_begin + NB_COLS - 1) / NB_COLS) * NB_COLS;
+            col_end = ((col_end + NB_COLS - 1) / NB_COLS) * NB_COLS;
+            col_end = MIN(col_end, ne01);
+            if (col_begin >= col_end) {
+                continue;
+            }
+
+            const int64_t chunk_cols = col_end - col_begin;
+            const char * expert_weights = (const char *) src0->data + (size_t) expert * nb02;
+            const char * grouped_inputs = wdata + (size_t) matrix_row_offsets[expert] * nbw1;
+            const int64_t batched_rows = count - count % 4;
+
+            for (int64_t row = 0; row < batched_rows; row += 4) {
+                gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                        ne00, thread_output, (size_t) chunk_cols,
+                        expert_weights + (size_t) col_begin * nb01,
+                        grouped_inputs + (size_t) row * nbw1,
+                        4, (int) chunk_cols);
+
+                for (int r = 0; r < 4; ++r) {
+                    const mmid_row_mapping mapping = MMID_BATCHED_ROW(expert, row + r);
+                    store_output(mapping, expert, col_begin,
+                            thread_output + (size_t) r * (size_t) chunk_cols, chunk_cols);
+                }
+            }
+
+            for (int64_t row = batched_rows; row < count; ++row) {
+                const mmid_row_mapping mapping = MMID_BATCHED_ROW(expert, row);
+                if (dst->type == GGML_TYPE_F32 && row_scale == nullptr) {
+                    float * target = (float *) ((char *) dst->data
+                            + (size_t) mapping.i1 * nb1 + (size_t) mapping.i2 * nb2) + col_begin;
+                    gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                            ne00, target, ne01,
+                            expert_weights + (size_t) col_begin * nb01,
+                            grouped_inputs + (size_t) row * nbw1,
+                            1, (int) chunk_cols);
+                } else {
+                    gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                            ne00, thread_output, ne01,
+                            expert_weights + (size_t) col_begin * nb01,
+                            grouped_inputs + (size_t) row * nbw1,
+                            1, (int) chunk_cols);
+                    store_output(mapping, expert, col_begin, thread_output, chunk_cols);
+                }
+            }
+        }
+
+#undef MMID_BATCHED_ROW
+    }
+
     void forward_mul_mat_id(ggml_compute_params * params, ggml_tensor * op) {
+        if constexpr (batch_mmid) {
+            forward_mul_mat_id_batched(params, op);
+            return;
+        }
+
         const ggml_tensor * src0 = op->src[0];
         const ggml_tensor * src1 = op->src[1];
         const ggml_tensor * ids  = op->src[2];
@@ -4519,6 +4827,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
     int repack(struct ggml_tensor * t, const void * data, size_t data_size) override {
         GGML_LOG_DEBUG("%s: repack tensor %s with %s_%dx%d\n", __func__, t->name, ggml_type_name(t->type),
                        (int) NB_COLS, (int) INTER_SIZE);
+
         return ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(t, data, data_size);
     }
 };
@@ -4542,6 +4851,11 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     // instance for Q6_K
     static const ggml::cpu::repack::tensor_traits<block_q6_K, 4, 8, GGML_TYPE_Q8_K> q6_K_8x4_q8_K;
     static const ggml::cpu::repack::tensor_traits<block_q6_K, 8, 8, GGML_TYPE_Q8_K> q6_K_8x8_q8_K;
+
+    // instance for SIGN1
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+    static const ggml::cpu::repack::tensor_traits<block_sign1, 8, 8, GGML_TYPE_Q8_1> sign1_8x8_q8_1;
+#endif
 
     // instance for Q2
     static const ggml::cpu::repack::tensor_traits<block_q2_K, 8, 8, GGML_TYPE_Q8_K> q2_K_8x8_q8_K;
@@ -4624,6 +4938,12 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
             }
             #endif
         }
+    } else if (cur->type == GGML_TYPE_SIGN1) {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+        if (ggml_cpu_has_avx512() && cur->ne[1] % 8 == 0) {
+            return &sign1_8x8_q8_1;
+        }
+#endif
     } else if (cur->type == GGML_TYPE_Q2_K) {
         if (ggml_cpu_has_avx512()) {
             if (cur->ne[1] % 8 == 0) {
@@ -4797,7 +5117,8 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
             }
-            if (op->src[1]->type == GGML_TYPE_F32) {
+            if (op->src[1]->type == GGML_TYPE_F32 ||
+                    (op->src[0]->type == GGML_TYPE_SIGN1 && op->src[1]->type == GGML_TYPE_F16)) {
                 return true;
             }
             //if (op->src[1]->type == GGML_TYPE_Q8_0) {

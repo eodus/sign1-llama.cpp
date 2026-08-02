@@ -7,7 +7,9 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-#if !defined(DATA_A_F32) && !defined(DATA_A_F16) && !defined(DATA_A_BF16)
+#if defined(DATA_A_SIGN1)
+#define K_PER_ITER 4
+#elif !defined(DATA_A_F32) && !defined(DATA_A_F16) && !defined(DATA_A_BF16)
 #define K_PER_ITER 8
 #else
 #define K_PER_ITER 4
@@ -49,7 +51,7 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         const uint iqs = (col%QUANT_K)/QUANT_R; // quant index
         const uint iybs = col - col%QUANT_K; // y block start index
 
-#if K_PER_ITER == 8
+#if K_PER_ITER >= 8
 #if QUANT_R == 2
         // Note that we end up fetching bogus elements here, but its fine as they'll be
         // within an accessible block.
@@ -68,22 +70,34 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 
         const vec4 b = load_b(j, iybs, iqs, lastiter, OOB_y, OOB_z, OOB_w);
 #endif
-        uint ibi = first_row*p.ncols;
+        // Avoid 32-bit overflow in first_row*p.ncols for very large quantized matrices.
+        // Since quantized rows are block-aligned, compute the block index directly:
+        // (first_row*p.ncols + col)/QUANT_K == first_row*(p.ncols/QUANT_K) + col/QUANT_K.
+        const uint blocks_per_row = p.ncols / QUANT_K;
+        uint ib = first_row*blocks_per_row + col/QUANT_K;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-            const uint ib = (ibi + col)/QUANT_K; // block index
-            ibi += p.ncols;
+            // block index
 
-#if K_PER_ITER == 8
+
+
+#if K_PER_ITER >= 8
+#ifdef DATA_A_SIGN1
+            const uint bits = data_a[a_offset + ib].qs[iqs / 32u] >> (iqs % 32u);
+            const bvec4 neg0 = notEqual(uvec4(bits) & uvec4(1u, 2u, 4u, 8u), uvec4(0u));
+            const bvec4 neg1 = notEqual(uvec4(bits) & uvec4(16u, 32u, 64u, 128u), uvec4(0u));
+            const vec4 signed0 = mix(vec4(bv0), -vec4(bv0), neg0);
+            const vec4 signed1 = mix(vec4(bv1), -vec4(bv1), neg1);
+            FLOAT_TYPE signed_sum = dot(signed0, vec4(1.0)) + dot(signed1, vec4(1.0));
+            temp[j][n] += signed_sum;
+#else
             vec4 v = dequantize4(ib, iqs, a_offset);
             vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
-
             const vec2 dm = get_dm(ib, a_offset);
             if (dm.y != 0) { // quant has min component
                 v = v * dm.x + dm.y;
                 v2 = v2 * dm.x + dm.y;
             }
 
-            // matrix multiplication
             FLOAT_TYPE rowtmp = dot(bv0, v);
             rowtmp += dot(bv1, v2);
 
@@ -91,6 +105,13 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
                 rowtmp *= dm.x;
 
             temp[j][n] += rowtmp;
+#endif
+#else
+#ifdef DATA_A_SIGN1
+            const uint bits = data_a[a_offset + ib].qs[iqs / 32u] >> (iqs % 32u);
+            const bvec4 neg = notEqual(uvec4(bits) & uvec4(1u, 2u, 4u, 8u), uvec4(0u));
+            const vec4 signed_b = mix(b, -b, neg);
+            temp[j][n] += dot(signed_b, vec4(1.0));
 #else
             if (!OOB_w) {
                 const vec4 v = dequantize4(ib, iqs, a_offset);
@@ -110,11 +131,14 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
                 temp[j][n] = fma(v, b.x, temp[j][n]);
             }
 #endif
+#endif
+            ib += blocks_per_row;
         }
     }
 }
 
 #if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)
+#define HAS_ALIGNED_NONQUANT 1
 void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i)
 {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
@@ -124,10 +148,15 @@ void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
 
         const vec4 b = data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4];
 
-        uint ibi = first_row*p.ncols;
+        // Avoid 32-bit overflow in first_row*p.ncols for very large quantized matrices.
+        // Since quantized rows are block-aligned, compute the block index directly:
+        // (first_row*p.ncols + col)/QUANT_K == first_row*(p.ncols/QUANT_K) + col/QUANT_K.
+        const uint blocks_per_row = p.ncols / QUANT_K;
+        uint ib = first_row*blocks_per_row + col/QUANT_K;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-            const uint ib = (ibi + col)/QUANT_K; // block index
-            ibi += p.ncols;
+            // block index
+
+
 
             const vec4 v = dequantize4_2aligned(ib, iqs, a_offset);
 
@@ -166,7 +195,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 
     uint i = 0;
 
-#if K_PER_ITER == 4
+#if K_PER_ITER == 4 && defined(HAS_ALIGNED_NONQUANT)
     // If the K dimension is odd, we need lastiter==true on the last iteration
     // so OOB is computed correctly. Skip some unrolling to make that happen.
     if ((p.ncols & 3) != 0 &&
@@ -191,14 +220,14 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
             i++;
         }
     }
-#if K_PER_ITER == 4
+#if K_PER_ITER == 4 && defined(HAS_ALIGNED_NONQUANT)
     }
 #endif
 
     unroll_count = 2;
     unrolled_iters = num_iters & ~(unroll_count - 1);
 
-#if K_PER_ITER == 4
+#if K_PER_ITER == 4 && defined(HAS_ALIGNED_NONQUANT)
     if ((p.ncols & 3) != 0 &&
         unrolled_iters == num_iters &&
         unrolled_iters > 0) {
@@ -222,11 +251,11 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
             i++;
         }
     }
-#if K_PER_ITER == 4
+#if K_PER_ITER == 4 && defined(HAS_ALIGNED_NONQUANT)
     }
 #endif
 
-#if K_PER_ITER == 4
+#if K_PER_ITER == 4 && defined(HAS_ALIGNED_NONQUANT)
     if (is_aligned_nonquant) {
         while (i < num_iters) {
             iter_aligned_nonquant(temp, first_row, num_rows, tid, i*K_PER_ITER);
@@ -238,7 +267,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         iter(temp, first_row, num_rows, tid, i*K_PER_ITER, true);
         i++;
     }
-#if K_PER_ITER == 4
+#if K_PER_ITER == 4 && defined(HAS_ALIGNED_NONQUANT)
     }
 #endif
 

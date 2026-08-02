@@ -1060,7 +1060,13 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * sign_down_u = nullptr,  ggml_tensor * sign_down_v = nullptr,
+             ggml_tensor * sign_down_din = nullptr, ggml_tensor * sign_down_dmid = nullptr, ggml_tensor * sign_down_dout = nullptr,
+             ggml_tensor * sign_gate_u = nullptr,  ggml_tensor * sign_gate_v = nullptr,
+             ggml_tensor * sign_gate_din = nullptr, ggml_tensor * sign_gate_dmid = nullptr, ggml_tensor * sign_gate_dout = nullptr,
+             ggml_tensor * sign_up_u   = nullptr,  ggml_tensor * sign_up_v   = nullptr,
+             ggml_tensor * sign_up_din = nullptr, ggml_tensor * sign_up_dmid = nullptr, ggml_tensor * sign_up_dout = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1086,7 +1092,13 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * sign_down_u = nullptr,  ggml_tensor * sign_down_v = nullptr,
+             ggml_tensor * sign_down_din = nullptr, ggml_tensor * sign_down_dmid = nullptr, ggml_tensor * sign_down_dout = nullptr,
+             ggml_tensor * sign_gate_u = nullptr,  ggml_tensor * sign_gate_v = nullptr,
+             ggml_tensor * sign_gate_din = nullptr, ggml_tensor * sign_gate_dmid = nullptr, ggml_tensor * sign_gate_dout = nullptr,
+             ggml_tensor * sign_up_u   = nullptr,  ggml_tensor * sign_up_v   = nullptr,
+             ggml_tensor * sign_up_din = nullptr, ggml_tensor * sign_up_dmid = nullptr, ggml_tensor * sign_up_dout = nullptr) const;
 
     //
     // inputs

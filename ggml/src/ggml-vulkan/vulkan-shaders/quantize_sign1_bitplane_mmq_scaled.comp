@@ -1,0 +1,178 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+#define MANTISSA_BITS 7u
+#define HEADER_WORDS 2u
+#define QMAX ((1u << MANTISSA_BITS) - 1u)
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint vector_length;
+    uint vectors;
+    uint input_columns;
+    uint n_as;
+    uint routing_nei1;
+} p;
+
+layout(std430, binding = 0) readonly buffer Input { uint input_bits[]; };
+layout(std430, binding = 1) buffer Output { uint packed[]; };
+layout(std430, binding = 2) readonly buffer Rows { u16vec2 compact_rows[]; };
+layout(std430, binding = 3) readonly buffer Scale { f16vec4 data_scale4[]; };
+
+uint64_t transpose8x8(uint64_t x) {
+    uint64_t t = (x ^ (x >> 7u)) & 0x00AA00AA00AA00AAul;
+    x ^= t ^ (t << 7u);
+    t = (x ^ (x >> 14u)) & 0x0000CCCC0000CCCCul;
+    x ^= t ^ (t << 14u);
+    t = (x ^ (x >> 28u)) & 0x00000000F0F0F0F0ul;
+    return x ^ t ^ (t << 28u);
+}
+
+struct Quantized4 {
+    uint magnitudes;
+    uint signs;
+};
+
+Quantized4 quantize4(vec4 values, float scale_inv) {
+    const uvec4 bits = floatBitsToUint(values);
+    const uint signs = (bits.x >> 31u) | ((bits.y >> 30u) & 2u)
+                     | ((bits.z >> 29u) & 4u) | ((bits.w >> 28u) & 8u);
+    const vec4 magnitudes = min(abs(values) * scale_inv, vec4(float(QMAX)));
+    return Quantized4(packUnorm4x8(magnitudes / 255.0f), signs);
+}
+
+uint find_expert(uint global_row) {
+    uint lo = 0u;
+    uint hi = p.n_as;
+    while (lo < hi) {
+        const uint mid = lo + (hi - lo) / 2u;
+        const uint offset = compact_rows[mid * (p.routing_nei1 + 1u)].x;
+        if (offset <= global_row) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo - 1u;
+}
+
+void main() {
+    const uint lanes_per_vector = p.vector_length / 32u;
+    const uint vectors_per_wave = 64u / lanes_per_vector;
+    const uint vectors_per_workgroup = 2u * vectors_per_wave;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint vector_in_wave = lane / lanes_per_vector;
+    const uint lane_in_vector = lane % lanes_per_vector;
+    const uint vector_in_workgroup = gl_SubgroupID * vectors_per_wave + vector_in_wave;
+    const uint global_row = gl_WorkGroupID.x * vectors_per_workgroup + vector_in_workgroup;
+    const bool valid_vector = global_row < p.vectors;
+
+    uint leader_expert = 0u;
+    if (valid_vector && lane_in_vector == 0u) {
+        leader_expert = find_expert(global_row);
+    }
+    const uint expert = subgroupShuffle(leader_expert, vector_in_wave * lanes_per_vector);
+
+    u16vec2 row = u16vec2(0u);
+    if (valid_vector) {
+        const uint global_rows_base = p.n_as * (p.routing_nei1 + 1u);
+        row = compact_rows[global_rows_base + global_row];
+    }
+    // Gate/up V share one hidden-state vector across selected experts, while down V
+    // receives one route-specific vector per (token, slot).
+    const uint input_vector = p.vector_length == 2048u
+        ? row.y
+        : row.y * p.input_columns + (row.x % p.input_columns);
+    const uint input_base = input_vector * p.vector_length + lane_in_vector * 32u;
+    const uint scale_base = expert * p.vector_length + lane_in_vector * 32u;
+
+    vec4 retained[8];
+    uint local_max_exponent = 0u;
+    [[unroll]] for (uint group = 0u; group < 8u; ++group) {
+        vec4 values = vec4(0.0f);
+        if (valid_vector) {
+            const uint offset = input_base + 4u * group;
+            const uvec4 bits = uvec4(
+                input_bits[offset + 0u], input_bits[offset + 1u],
+                input_bits[offset + 2u], input_bits[offset + 3u]);
+            const uint scale_vec4 = scale_base / 4u + group;
+            const vec4 din = vec4(data_scale4[scale_vec4]);
+            values = uintBitsToFloat(bits) * din;
+            const uvec4 exponents = (floatBitsToUint(abs(values)) >> 23u) & uvec4(0xffu);
+            local_max_exponent = max(local_max_exponent,
+                max(max(exponents.x, exponents.y), max(exponents.z, exponents.w)));
+        }
+        retained[group] = values;
+    }
+
+    uint max_exponent;
+    if (p.vector_length == 512u) {
+        max_exponent = subgroupClusteredMax(local_max_exponent, 16u);
+    } else if (p.vector_length == 1024u) {
+        max_exponent = subgroupClusteredMax(local_max_exponent, 32u);
+    } else {
+        max_exponent = subgroupMax(local_max_exponent);
+    }
+    const uint scale_exponent = max_exponent > (MANTISSA_BITS - 1u)
+        ? max_exponent - (MANTISSA_BITS - 1u) : 1u;
+    const float scale = max_exponent == 0u ? 1.0f : uintBitsToFloat(scale_exponent << 23u);
+    const float scale_inv = 1.0f / scale;
+
+    uint local_magnitude_sum = 0u;
+    uint sign_word = 0u;
+    uint magnitude_words[8];
+    [[unroll]] for (uint group = 0u; group < 8u; ++group) {
+        const Quantized4 q = quantize4(retained[group], scale_inv);
+        magnitude_words[group] = q.magnitudes;
+        local_magnitude_sum += dotPacked4x8EXT(q.magnitudes, 0x01010101u);
+        sign_word |= q.signs << (4u * group);
+    }
+
+    uint planes[MANTISSA_BITS];
+    [[unroll]] for (uint bit = 0u; bit < MANTISSA_BITS; ++bit) planes[bit] = 0u;
+    [[unroll]] for (uint group = 0u; group < 4u; ++group) {
+        const uint64_t bytes = uint64_t(magnitude_words[2u * group])
+                             | (uint64_t(magnitude_words[2u * group + 1u]) << 32u);
+        const uint64_t transposed = transpose8x8(bytes);
+        [[unroll]] for (uint bit = 0u; bit < MANTISSA_BITS; ++bit) {
+            planes[bit] |= uint((transposed >> (8u * bit)) & 0xfful) << (8u * group);
+        }
+    }
+
+    // The global compact list is already expert-major, so its row index is also
+    // the final private output index. This avoids the sparse expert x token grid.
+    const uint output_vector = global_row;
+    const uint words_per_vector = HEADER_WORDS + lanes_per_vector * (1u + MANTISSA_BITS);
+    const uint output_base = output_vector * words_per_vector;
+    if (valid_vector) {
+        const uint record = output_base + HEADER_WORDS + lane_in_vector * (1u + MANTISSA_BITS);
+        packed[record] = sign_word;
+        [[unroll]] for (uint bit = 0u; bit < MANTISSA_BITS; ++bit) {
+            packed[record + 1u + bit] = planes[bit];
+        }
+    }
+
+    uint vector_magnitude_sum;
+    if (p.vector_length == 512u) {
+        vector_magnitude_sum = subgroupClusteredAdd(local_magnitude_sum, 16u);
+    } else if (p.vector_length == 1024u) {
+        vector_magnitude_sum = subgroupClusteredAdd(local_magnitude_sum, 32u);
+    } else {
+        vector_magnitude_sum = subgroupAdd(local_magnitude_sum);
+    }
+    if (valid_vector && lane_in_vector == 0u) {
+        packed[output_base] = floatBitsToUint(scale);
+        packed[output_base + 1u] = vector_magnitude_sum;
+    }
+}

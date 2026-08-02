@@ -190,6 +190,13 @@ typedef struct {
     uint8_t qs[QK2_0 / 4];   // 2 bits per element
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+// SIGN1 is pure sign storage with IEEE-style sign-bit semantics:
+// bit 0 -> +1, bit 1 -> -1. Magnitudes/scalers live in separate tensors.
+#define QK_SIGN1 64
+typedef struct {
+    uint64_t qs; // 64 sign bits
+} block_sign1;
+static_assert(sizeof(block_sign1) == QK_SIGN1 / 8, "wrong sign1 block size/padding");
 
 #define QK4_0 32
 typedef struct {

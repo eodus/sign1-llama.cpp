@@ -1248,6 +1248,7 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_SIGN1:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -5088,6 +5089,61 @@ void ggml_compute_forward_get_rows(
     //}
 }
 
+void ggml_compute_forward_mul_rows_id(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * scale = dst->src[1];
+    const ggml_tensor * ids   = dst->src[2];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F16 || scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(x->nb[0] == sizeof(float));
+    GGML_ASSERT(scale->nb[0] == ggml_type_size(scale->type));
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int64_t width    = dst->ne[0];
+    const int64_t n_rows   = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    const int64_t nr       = n_rows * n_tokens;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    const size_t scratch_stride = width * sizeof(float) + CACHE_LINE_SIZE;
+    float * scale_f32 = (float *) ((char *) params->wdata + ith * scratch_stride);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t token = ir / n_rows;
+        const int64_t row   = ir - token * n_rows;
+        const int64_t x_row = x->ne[1] == 1 ? 0 : row;
+        const int32_t expert = *(const int32_t *) ((const char *) ids->data +
+                row * ids->nb[0] + token * ids->nb[1]);
+
+        GGML_ASSERT(expert >= 0 && expert < scale->ne[1]);
+
+        const float * x_ptr = (const float *) ((const char *) x->data +
+                x_row * x->nb[1] + token * x->nb[2]);
+        float * dst_ptr = (float *) ((char *) dst->data +
+                row * dst->nb[1] + token * dst->nb[2]);
+
+        if (scale->type == GGML_TYPE_F16) {
+            const ggml_fp16_t * scale_ptr = (const ggml_fp16_t *) ((const char *) scale->data +
+                    expert * scale->nb[1]);
+            ggml_cpu_fp16_to_fp32(scale_ptr, scale_f32, width);
+            ggml_vec_mul_f32(width, dst_ptr, x_ptr, scale_f32);
+        } else {
+            const float * scale_ptr = (const float *) ((const char *) scale->data +
+                    expert * scale->nb[1]);
+            ggml_vec_mul_f32(width, dst_ptr, x_ptr, scale_ptr);
+        }
+    }
+}
+
 template<typename src_t, typename idx_t>
 static void ggml_compute_forward_set_rows_impl(
         const ggml_compute_params * params,
@@ -5780,6 +5836,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_SIGN1:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:

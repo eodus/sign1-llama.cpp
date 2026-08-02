@@ -1,0 +1,89 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define MUL_MAT_ID 1
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint first_row = gl_WorkGroupID.x * 2u;
+    if (first_row >= p.stride_d) return;
+
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    // Canonical SIGN1 layout: each row has K/64 blocks. Each lane consumes
+    // one 32-sign half-block from two adjacent output rows.
+    const uint blocks_per_row = p.ncols / 64u;
+    const uint half_idx = lane & 1u;
+    const block_sign1 block0 = data_a[a_offset + first_row * blocks_per_row + (lane >> 1u)];
+    const block_sign1 block1 = data_a[a_offset + (first_row + 1u) * blocks_per_row + (lane >> 1u)];
+    const uint signs0 = half_idx == 0u ? block0.qs[0] : block0.qs[1];
+    const uint signs1 = half_idx == 0u ? block1.qs[0] : block1.qs[1];
+    const uint activation_base = b_offset + lane * 32u;
+
+    const vec4 x00 = vec4(data_b_v4[(activation_base +  0u) / 4u]);
+    const vec4 x01 = vec4(data_b_v4[(activation_base +  0u) / 4u + 1u]);
+    const uint r00 = signs0;
+    const uint r10 = signs1;
+    const vec2 s0 = vec2(
+        dot(mix(x00, -x00, notEqual(uvec4(r00) & uvec4(1u,2u,4u,8u), uvec4(0u))), vec4(1.0)) +
+        dot(mix(x01, -x01, notEqual(uvec4(r00) & uvec4(16u,32u,64u,128u), uvec4(0u))), vec4(1.0)),
+        dot(mix(x00, -x00, notEqual(uvec4(r10) & uvec4(1u,2u,4u,8u), uvec4(0u))), vec4(1.0)) +
+        dot(mix(x01, -x01, notEqual(uvec4(r10) & uvec4(16u,32u,64u,128u), uvec4(0u))), vec4(1.0)));
+
+    const vec4 x10 = vec4(data_b_v4[(activation_base +  8u) / 4u]);
+    const vec4 x11 = vec4(data_b_v4[(activation_base +  8u) / 4u + 1u]);
+    const uint r01 = signs0 >> 8u;
+    const uint r11 = signs1 >> 8u;
+    const vec2 s1 = vec2(
+        dot(mix(x10, -x10, notEqual(uvec4(r01) & uvec4(1u,2u,4u,8u), uvec4(0u))), vec4(1.0)) +
+        dot(mix(x11, -x11, notEqual(uvec4(r01) & uvec4(16u,32u,64u,128u), uvec4(0u))), vec4(1.0)),
+        dot(mix(x10, -x10, notEqual(uvec4(r11) & uvec4(1u,2u,4u,8u), uvec4(0u))), vec4(1.0)) +
+        dot(mix(x11, -x11, notEqual(uvec4(r11) & uvec4(16u,32u,64u,128u), uvec4(0u))), vec4(1.0)));
+
+    const vec4 x20 = vec4(data_b_v4[(activation_base + 16u) / 4u]);
+    const vec4 x21 = vec4(data_b_v4[(activation_base + 16u) / 4u + 1u]);
+    const uint r02 = signs0 >> 16u;
+    const uint r12 = signs1 >> 16u;
+    const vec2 s2 = vec2(
+        dot(mix(x20, -x20, notEqual(uvec4(r02) & uvec4(1u,2u,4u,8u), uvec4(0u))), vec4(1.0)) +
+        dot(mix(x21, -x21, notEqual(uvec4(r02) & uvec4(16u,32u,64u,128u), uvec4(0u))), vec4(1.0)),
+        dot(mix(x20, -x20, notEqual(uvec4(r12) & uvec4(1u,2u,4u,8u), uvec4(0u))), vec4(1.0)) +
+        dot(mix(x21, -x21, notEqual(uvec4(r12) & uvec4(16u,32u,64u,128u), uvec4(0u))), vec4(1.0)));
+
+    const vec4 x30 = vec4(data_b_v4[(activation_base + 24u) / 4u]);
+    const vec4 x31 = vec4(data_b_v4[(activation_base + 24u) / 4u + 1u]);
+    const uint r03 = signs0 >> 24u;
+    const uint r13 = signs1 >> 24u;
+    const vec2 s3 = vec2(
+        dot(mix(x30, -x30, notEqual(uvec4(r03) & uvec4(1u,2u,4u,8u), uvec4(0u))), vec4(1.0)) +
+        dot(mix(x31, -x31, notEqual(uvec4(r03) & uvec4(16u,32u,64u,128u), uvec4(0u))), vec4(1.0)),
+        dot(mix(x30, -x30, notEqual(uvec4(r13) & uvec4(1u,2u,4u,8u), uvec4(0u))), vec4(1.0)) +
+        dot(mix(x31, -x31, notEqual(uvec4(r13) & uvec4(16u,32u,64u,128u), uvec4(0u))), vec4(1.0)));
+
+    const vec2 reduced = subgroupAdd((s0 + s1) + (s2 + s3));
+    FLOAT_TYPE acc0 = FLOAT_TYPE(reduced.x);
+    FLOAT_TYPE acc1 = FLOAT_TYPE(reduced.y);
+    if (lane == 0u) {
+        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE_ROWS_ID) != 0) {
+            acc0 *= FLOAT_TYPE(load_fuse0_f16(expert_id*p.stride_d + first_row));
+            acc1 *= FLOAT_TYPE(load_fuse0_f16(expert_id*p.stride_d + first_row + 1u));
+        }
+        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
+            acc0 *= FLOAT_TYPE(data_fuse0[gl_WorkGroupID.y]);
+            acc1 *= FLOAT_TYPE(data_fuse0[gl_WorkGroupID.y]);
+        }
+        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
+            acc0 *= FLOAT_TYPE(data_fuse1[gl_WorkGroupID.y]);
+            acc1 *= FLOAT_TYPE(data_fuse1[gl_WorkGroupID.y]);
+        }
+        data_d[d_offset + first_row] = D_TYPE(acc0);
+        data_d[d_offset + first_row + 1u] = D_TYPE(acc1);
+    }
+}

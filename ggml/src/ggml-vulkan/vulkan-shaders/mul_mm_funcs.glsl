@@ -163,6 +163,58 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             buf_a[buf_idx    ] = d * (FLOAT_TYPEV2(bits & 3u, (bits >> 2u) & 3u) - FLOAT_TYPEV2(1.0f));
             buf_a[buf_idx + 1] = d * (FLOAT_TYPEV2((bits >> 4u) & 3u, bits >> 6u) - FLOAT_TYPEV2(1.0f));
+#elif defined(DATA_A_SIGN1)
+            // Routed SIGN1 tensors are repacked at upload so one uint64 contains
+            // exactly the sign segments consumed by one generation-kernel lane:
+            // K=2048: 2 rows x 32 signs; K=1024: 4 x 16; K=512: 8 x 8.
+            // Translate the logical MMQ (expert,row,k) address to that physical layout.
+            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+            FLOAT_TYPE sign1_vals[8];
+#ifdef MUL_MAT_ID
+            const uint k_base = block + row * LOAD_VEC_A;
+            const uint chunks_per_expert = p.M * (p.K / LOAD_VEC_A);
+            const uint expert = pos_a / chunks_per_expert;
+            if (p.K == 2048u) {
+                const uint64_t elem_base = uint64_t(expert) * uint64_t(p.M) * uint64_t(p.K) +
+                    uint64_t(idx_m) * uint64_t(p.K) + uint64_t(k_base);
+                [[unroll]] for (uint sign1_j = 0; sign1_j < 8; ++sign1_j) {
+                    const uint64_t sign1_elem = elem_base + uint64_t(sign1_j);
+                    const uint sign1_ib = uint(sign1_elem / uint64_t(64));
+                    const uint sign1_bit = uint(sign1_elem & uint64_t(63));
+                    const uint sign1_word = data_a[sign1_ib].qs[sign1_bit >> 5u];
+                    const bool sign1_neg = ((sign1_word >> (sign1_bit & 31u)) & 1u) != 0u;
+                    sign1_vals[sign1_j] = FLOAT_TYPE(sign1_neg ? -1.0f : 1.0f);
+                }
+            } else {
+                const uint tile_rows = 4096u / p.K;
+                const uint chunk_bits = p.K / 64u;
+                const uint expert_block_base = expert * p.M * (p.K / 64u);
+                const uint physical_block = expert_block_base +
+                    (idx_m / tile_rows) * 64u + k_base / chunk_bits;
+                const uint physical_bit = (idx_m % tile_rows) * chunk_bits + k_base % chunk_bits;
+                const uint sign1_byte = data_a[physical_block].qs[physical_bit >> 5u] >> (physical_bit & 31u);
+                [[unroll]] for (uint sign1_j = 0; sign1_j < 8; ++sign1_j) {
+                    const bool sign1_neg = ((sign1_byte >> sign1_j) & 1u) != 0u;
+                    sign1_vals[sign1_j] = FLOAT_TYPE(sign1_neg ? -1.0f : 1.0f);
+                }
+            }
+#else
+            const uint sign1_chunk_base = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+            const uint64_t sign1_elem_base = uint64_t(sign1_chunk_base) * uint64_t(LOAD_VEC_A);
+            [[unroll]] for (uint sign1_j = 0; sign1_j < 8; ++sign1_j) {
+                const uint64_t sign1_elem = sign1_elem_base + uint64_t(sign1_j);
+                const uint sign1_ib = uint(sign1_elem / uint64_t(64));
+                const uint sign1_bit = uint(sign1_elem & uint64_t(63));
+                const uint sign1_word = data_a[sign1_ib].qs[sign1_bit >> 5u];
+                const bool sign1_neg = ((sign1_word >> (sign1_bit & 31u)) & 1u) != 0u;
+                sign1_vals[sign1_j] = FLOAT_TYPE(sign1_neg ? -1.0f : 1.0f);
+            }
+#endif
+
+            buf_a[buf_idx    ] = FLOAT_TYPEV2(sign1_vals[0], sign1_vals[1]);
+            buf_a[buf_idx + 1] = FLOAT_TYPEV2(sign1_vals[2], sign1_vals[3]);
+            buf_a[buf_idx + 2] = FLOAT_TYPEV2(sign1_vals[4], sign1_vals[5]);
+            buf_a[buf_idx + 3] = FLOAT_TYPEV2(sign1_vals[6], sign1_vals[7]);
 #elif defined(DATA_A_Q2_K)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;

@@ -4,6 +4,7 @@
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+#define MAT_VEC_FUSION_FLAGS_SCALE_ROWS_ID 0x10
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)
@@ -27,9 +28,9 @@ layout (binding = 1) readonly buffer BV4 {B_TYPEV4 data_b_v4[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
 layout (binding = 3) readonly buffer Fuse0 {D_TYPE data_fuse0[];};
+layout (binding = 3) readonly buffer Fuse0U32 {uint data_fuse0_u32[];};
 layout (binding = 4) readonly buffer Fuse1 {D_TYPE data_fuse1[];};
 
 #ifdef MUL_MAT_ID
 layout (binding = 5) readonly buffer IDS {int data_ids[];};
 #endif
-

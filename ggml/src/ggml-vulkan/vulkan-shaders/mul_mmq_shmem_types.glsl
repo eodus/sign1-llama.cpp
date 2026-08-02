@@ -47,6 +47,11 @@ struct block_a_cache {
     int32_t qs[32/4];
     FLOAT_TYPE dm;
 };
+#elif defined(DATA_A_SIGN1)
+#define QUANT_R_MMQ 1
+struct block_a_cache {
+    uint32_t bits;
+};
 #elif defined(DATA_A_IQ4_NL)
 #define QUANT_R_MMQ 2
 struct block_a_cache {
@@ -92,8 +97,15 @@ struct block_a_cache {
 };
 #endif
 
+#if defined(DATA_B_F32)
+struct block_b_cache
+{
+    float x[32];
+};
+#else
 struct block_b_cache
 {
     int32_t qs[8];
     FLOAT_TYPEV2 ds;
 };
+#endif

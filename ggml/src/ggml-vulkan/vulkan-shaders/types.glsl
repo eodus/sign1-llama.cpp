@@ -235,6 +235,21 @@ struct block_q2_0_packed16
 #define DATA_A_QUANT_LEGACY
 #endif
 
+#define QUANT_K_SIGN1 64
+#define QUANT_R_SIGN1 1
+
+struct block_sign1
+{
+    uint qs[2];
+};
+
+#if defined(DATA_A_SIGN1)
+#define QUANT_K QUANT_K_SIGN1
+#define QUANT_R QUANT_R_SIGN1
+#define QUANT_AUXF 0
+#define A_TYPE block_sign1
+#endif
+
 #define QUANT_K_Q8_1 32
 #define QUANT_R_Q8_1 1
 

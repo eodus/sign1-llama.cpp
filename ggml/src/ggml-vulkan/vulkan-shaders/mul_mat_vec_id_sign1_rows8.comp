@@ -1,0 +1,93 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define MUL_MAT_ID 1
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#define MAT_VEC_FUSION_FLAGS_INPUT_SCALE_ROWS_ID 0x20u
+
+vec4 load_input4(const uint input_word, const uint din_element) {
+    vec4 value = vec4(data_b_v4[input_word]);
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_INPUT_SCALE_ROWS_ID) != 0u) {
+        const vec2 scale01 = unpackHalf2x16(floatBitsToUint(data_fuse1[din_element / 2u]));
+        const vec2 scale23 = unpackHalf2x16(floatBitsToUint(data_fuse1[din_element / 2u + 1u]));
+        value *= vec4(scale01, scale23);
+    }
+    return value;
+}
+
+FLOAT_TYPE signed_sum8(const vec4 x0, const vec4 x1, const uint bits) {
+    const bvec4 neg0 = notEqual(uvec4(bits) & uvec4(1u,2u,4u,8u), uvec4(0u));
+    const bvec4 neg1 = notEqual(uvec4(bits) & uvec4(16u,32u,64u,128u), uvec4(0u));
+    return FLOAT_TYPE(dot(mix(x0, -x0, neg0), vec4(1.0)) +
+                      dot(mix(x1, -x1, neg1), vec4(1.0)));
+}
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint first_row = gl_WorkGroupID.x * 8u;
+    if (first_row >= p.stride_d) return;
+
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    // K=512: every lane owns eight adjacent activations and contributes
+    // to all eight output rows. The repacked uint64 stores one sign byte
+    // per row for this lane's activation chunk.
+    const uint block_index = a_offset + (first_row >> 3u) * 64u + lane;
+    const uvec2 signs = uvec2(data_a[block_index].qs[0], data_a[block_index].qs[1]);
+    const uint activation_base = b_offset + lane * 8u;
+    const uint din_base = expert_id * p.ncols + lane * 8u;
+    const vec4 x0 = load_input4(activation_base / 4u, din_base);
+    const vec4 x1 = load_input4(activation_base / 4u + 1u, din_base + 4u);
+
+    vec4 acc_lo = vec4(
+        signed_sum8(x0, x1, signs.x),
+        signed_sum8(x0, x1, signs.x >> 8u),
+        signed_sum8(x0, x1, signs.x >> 16u),
+        signed_sum8(x0, x1, signs.x >> 24u));
+    vec4 acc_hi = vec4(
+        signed_sum8(x0, x1, signs.y),
+        signed_sum8(x0, x1, signs.y >> 8u),
+        signed_sum8(x0, x1, signs.y >> 16u),
+        signed_sum8(x0, x1, signs.y >> 24u));
+
+    acc_lo = subgroupAdd(acc_lo);
+    acc_hi = subgroupAdd(acc_hi);
+    if (lane == 0u) {
+        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE_ROWS_ID) != 0) {
+            acc_lo *= vec4(
+                load_fuse0_f16(expert_id*p.stride_d + first_row + 0u),
+                load_fuse0_f16(expert_id*p.stride_d + first_row + 1u),
+                load_fuse0_f16(expert_id*p.stride_d + first_row + 2u),
+                load_fuse0_f16(expert_id*p.stride_d + first_row + 3u));
+            acc_hi *= vec4(
+                load_fuse0_f16(expert_id*p.stride_d + first_row + 4u),
+                load_fuse0_f16(expert_id*p.stride_d + first_row + 5u),
+                load_fuse0_f16(expert_id*p.stride_d + first_row + 6u),
+                load_fuse0_f16(expert_id*p.stride_d + first_row + 7u));
+        }
+        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
+            const FLOAT_TYPE scale = FLOAT_TYPE(data_fuse0[gl_WorkGroupID.y]);
+            acc_lo *= scale;
+            acc_hi *= scale;
+        }
+        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
+            const FLOAT_TYPE scale = FLOAT_TYPE(data_fuse1[gl_WorkGroupID.y]);
+            acc_lo *= scale;
+            acc_hi *= scale;
+        }
+        data_d[d_offset + first_row + 0u] = D_TYPE(acc_lo.x);
+        data_d[d_offset + first_row + 1u] = D_TYPE(acc_lo.y);
+        data_d[d_offset + first_row + 2u] = D_TYPE(acc_lo.z);
+        data_d[d_offset + first_row + 3u] = D_TYPE(acc_lo.w);
+        data_d[d_offset + first_row + 4u] = D_TYPE(acc_hi.x);
+        data_d[d_offset + first_row + 5u] = D_TYPE(acc_hi.y);
+        data_d[d_offset + first_row + 6u] = D_TYPE(acc_hi.z);
+        data_d[d_offset + first_row + 7u] = D_TYPE(acc_hi.w);
+    }
+}

@@ -129,6 +129,69 @@ static __global__ void k_get_rows_float_vec(
     }
 }
 
+template<typename scale_t>
+static __global__ void k_mul_rows_id(
+        const float * __restrict__ x,
+        const scale_t * __restrict__ scale,
+        const int32_t * __restrict__ ids,
+        float * __restrict__ dst,
+        int64_t width, int64_t n_rows, int64_t n_tokens, int64_t x_rows,
+        size_t x_nb1, size_t x_nb2,
+        size_t scale_nb1,
+        size_t ids_nb0, size_t ids_nb1,
+        size_t dst_nb1, size_t dst_nb2) {
+    const int64_t count = width * n_rows * n_tokens;
+    for (int64_t index = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+            index < count; index += (int64_t) blockDim.x * gridDim.x) {
+        const int64_t col = index % width;
+        const int64_t ir = index / width;
+        const int64_t row = ir % n_rows;
+        const int64_t token = ir / n_rows;
+        const int64_t x_row = x_rows == 1 ? 0 : row;
+
+        const int32_t expert = *(const int32_t *) ((const char *) ids +
+                row * ids_nb0 + token * ids_nb1);
+        const float xv = *(const float *) ((const char *) x +
+                col * sizeof(float) + x_row * x_nb1 + token * x_nb2);
+        const scale_t sv = *(const scale_t *) ((const char *) scale +
+                col * sizeof(scale_t) + (int64_t) expert * scale_nb1);
+        *(float *) ((char *) dst + col * sizeof(float) + row * dst_nb1 + token * dst_nb2) =
+                xv * ggml_cuda_cast<float>(sv);
+    }
+}
+
+static __global__ void k_mul_rows_id_f16_vec4(
+        const float * __restrict__ x,
+        const half * __restrict__ scale,
+        const int32_t * __restrict__ ids,
+        float * __restrict__ dst,
+        int64_t width4, int64_t n_rows, int64_t n_tokens, int64_t x_rows,
+        size_t x_nb1, size_t x_nb2,
+        size_t scale_nb1,
+        size_t ids_nb0, size_t ids_nb1,
+        size_t dst_nb1, size_t dst_nb2) {
+    const int64_t count = width4 * n_rows * n_tokens;
+    for (int64_t index = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+            index < count; index += (int64_t) blockDim.x * gridDim.x) {
+        const int64_t col4 = index % width4;
+        const int64_t ir = index / width4;
+        const int64_t row = ir % n_rows;
+        const int64_t token = ir / n_rows;
+        const int64_t x_row = x_rows == 1 ? 0 : row;
+        const int64_t col = 4 * col4;
+        const int32_t expert = *(const int32_t *) ((const char *) ids +
+                row * ids_nb0 + token * ids_nb1);
+        const float4 xv = *(const float4 *) ((const char *) x +
+                col * sizeof(float) + x_row * x_nb1 + token * x_nb2);
+        const half * sv = (const half *) ((const char *) scale +
+                col * sizeof(half) + (int64_t) expert * scale_nb1);
+        const float4 out = make_float4(
+                xv.x * __half2float(sv[0]), xv.y * __half2float(sv[1]),
+                xv.z * __half2float(sv[2]), xv.w * __half2float(sv[3]));
+        *(float4 *) ((char *) dst + col * sizeof(float) + row * dst_nb1 + token * dst_nb2) = out;
+    }
+}
+
 template<typename grad_t, typename dst_t>
 static __global__ void k_get_rows_back_float(
         const grad_t * __restrict__ grad, const int32_t * __restrict__ rows, dst_t * __restrict__ dst,
@@ -324,6 +387,10 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK2_0, QR2_0, dequantize_q2_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_SIGN1:
+            get_rows_cuda_q<QK_SIGN1, 1, dequantize_sign1>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
         case GGML_TYPE_Q4_0:
             get_rows_cuda_q<QK4_0, QR4_0, dequantize_q4_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
@@ -456,6 +523,65 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+}
+
+static void ggml_cuda_mul_rows_id_impl(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * x,
+        const ggml_tensor * scale,
+        const ggml_tensor * ids,
+        ggml_tensor * dst) {
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F16 || scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float));
+    GGML_ASSERT(scale->nb[0] == ggml_type_size(scale->type));
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int64_t width = dst->ne[0];
+    const int64_t n_rows = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    const int64_t count = width * n_rows * n_tokens;
+    const int block_size = 256;
+    const int block_count = (int) MIN((count + block_size - 1) / block_size, (int64_t) 65535);
+    cudaStream_t stream = ctx.stream();
+
+    if (scale->type == GGML_TYPE_F16 && width % 4 == 0 &&
+            x->nb[1] % alignof(float4) == 0 && x->nb[2] % alignof(float4) == 0 &&
+            dst->nb[1] % alignof(float4) == 0 && dst->nb[2] % alignof(float4) == 0) {
+        const int64_t count4 = count / 4;
+        const int block_count4 = (int) MIN((count4 + block_size - 1) / block_size, (int64_t) 65535);
+        k_mul_rows_id_f16_vec4<<<block_count4, block_size, 0, stream>>>(
+            (const float *) x->data, (const half *) scale->data, (const int32_t *) ids->data,
+            (float *) dst->data, width / 4, n_rows, n_tokens, x->ne[1],
+            x->nb[1], x->nb[2], scale->nb[1], ids->nb[0], ids->nb[1], dst->nb[1], dst->nb[2]);
+    } else if (scale->type == GGML_TYPE_F16) {
+        k_mul_rows_id<<<block_count, block_size, 0, stream>>>(
+            (const float *) x->data, (const half *) scale->data, (const int32_t *) ids->data,
+            (float *) dst->data, width, n_rows, n_tokens, x->ne[1],
+            x->nb[1], x->nb[2], scale->nb[1], ids->nb[0], ids->nb[1], dst->nb[1], dst->nb[2]);
+    } else {
+        k_mul_rows_id<<<block_count, block_size, 0, stream>>>(
+            (const float *) x->data, (const float *) scale->data, (const int32_t *) ids->data,
+            (float *) dst->data, width, n_rows, n_tokens, x->ne[1],
+            x->nb[1], x->nb[2], scale->nb[1], ids->nb[0], ids->nb[1], dst->nb[1], dst->nb[2]);
+    }
+}
+
+void ggml_cuda_op_mul_rows_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_mul_rows_id_impl(ctx, dst->src[0], dst->src[1], dst->src[2], dst);
+    if (dst->src[0]->ne[1] != 1) {
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    }
+}
+
+void ggml_cuda_scale_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (dst->src[3] != nullptr) {
+        ggml_cuda_mul_rows_id_impl(ctx, dst, dst->src[3], dst->src[2], dst);
+    }
 }
 
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

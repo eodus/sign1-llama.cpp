@@ -30,6 +30,10 @@ void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q2_0_ref(x, y, k);
 }
 
+void quantize_row_sign1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_sign1_ref(x, y, k);
+}
+
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_0_ref(x, y, k);
 }
@@ -123,6 +127,212 @@ void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
 }
 
 //===================================== Dot products =================================
+
+
+void ggml_vec_dot_sign1_f32_generic(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_SIGN1;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_sign1 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        const uint64_t bits = x[i].qs;
+        const float * yp = y + i*qk;
+        for (int j = 0; j < qk; ++j) {
+            // SIGN1 convention: bit 0 => +1, bit 1 => -1.
+            sumf += ((bits >> j) & UINT64_C(1)) ? -yp[j] : yp[j];
+        }
+    }
+
+    *s = sumf;
+}
+
+
+void ggml_vec_dot_sign1_f32_q8_1_emulated(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_SIGN1;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_sign1 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+    for (int ib = 0; ib < nb; ++ib) {
+        const uint64_t bits = x[ib].qs;
+        const float * yp = y + ib*qk;
+        for (int half = 0; half < 2; ++half) {
+            const int off = half * QK8_1;
+            float amax = 0.0f;
+            for (int j = 0; j < QK8_1; ++j) {
+                const float ay = fabsf(yp[off + j]);
+                amax = ay > amax ? ay : amax;
+            }
+            // Match CUDA/ROCm MMQ D4 quantization contract: one FP32 scale per
+            // 32-value chunk, q = roundf(x * (127 / amax)), result *= (1 / d_inv).
+            const float d_inv = amax == 0.0f ? 0.0f : 127.0f / amax;
+            int sumi = 0;
+            if (d_inv != 0.0f) {
+                for (int j = 0; j < QK8_1; ++j) {
+                    int q = (int) roundf(yp[off + j] * d_inv);
+                    q = q < -127 ? -127 : (q > 127 ? 127 : q);
+                    // SIGN1 convention: bit 0 => +1, bit 1 => -1.
+                    sumi += ((bits >> (off + j)) & UINT64_C(1)) ? -q : q;
+                }
+            }
+            const float d = d_inv == 0.0f ? 0.0f : 1.0f / d_inv;
+            sumf += d * (float) sumi;
+        }
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_sign1_q8_1_generic(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_SIGN1;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_sign1 * GGML_RESTRICT x = vx;
+    const block_q8_1  * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        const uint64_t bits64 = x[i].qs;
+        for (int iqs = 0; iqs < 2; ++iqs) {
+            const block_q8_1 * GGML_RESTRICT yb = &y[i*2 + iqs];
+            const float d8 = GGML_CPU_FP16_TO_FP32(yb->d);
+            const uint32_t v = (uint32_t) (bits64 >> (iqs * 32));
+
+            int sumi = 0;
+            for (int j = 0; j < 8; ++j) {
+                // CUDA vec_dot_sign1_q8_1 packs four int8 SIGN1 lanes and does dp4a
+                // against four int8 Q8_1 lanes. Keep the same lane order and sign
+                // convention here for a bit-for-bit integer dot contract.
+                const int shift = j * 4;
+                const int bits4 = (int) ((v >> shift) & 0x0Fu);
+                const int b0 = (bits4 & 0x01) ? -1 : 1;
+                const int b1 = (bits4 & 0x02) ? -1 : 1;
+                const int b2 = (bits4 & 0x04) ? -1 : 1;
+                const int b3 = (bits4 & 0x08) ? -1 : 1;
+                const int8_t * GGML_RESTRICT qy = yb->qs + 4*j;
+                sumi += b0 * (int) qy[0]
+                      + b1 * (int) qy[1]
+                      + b2 * (int) qy[2]
+                      + b3 * (int) qy[3];
+            }
+            sumf += d8 * (float) sumi;
+        }
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_sign1_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_SIGN1;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_sign1 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        const uint64_t bits64 = x[i].qs;
+        float sumi = 0.0f;
+
+        for (int q = 0; q < 2; ++q) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i*2 + q];
+            const float d = GGML_CPU_FP16_TO_FP32(yb->d);
+            const int8_t * GGML_RESTRICT qy = yb->qs;
+            int sumi_block = 0;
+
+            for (int b = 0; b < 4; ++b, qy += 8) {
+                const unsigned mask = (bits64 >> (q*32 + b*8)) & 0xFFu;
+                // SIGN1 convention: bit 0 => +1, bit 1 => -1.
+                sumi_block += ((mask & 0x01) ? -qy[0] : qy[0])
+                           +  ((mask & 0x02) ? -qy[1] : qy[1])
+                           +  ((mask & 0x04) ? -qy[2] : qy[2])
+                           +  ((mask & 0x08) ? -qy[3] : qy[3])
+                           +  ((mask & 0x10) ? -qy[4] : qy[4])
+                           +  ((mask & 0x20) ? -qy[5] : qy[5])
+                           +  ((mask & 0x40) ? -qy[6] : qy[6])
+                           +  ((mask & 0x80) ? -qy[7] : qy[7]);
+            }
+
+            sumi += d * sumi_block;
+        }
+
+        sumf += sumi;
+    }
+
+    *s = sumf;
+}
+
+
+void ggml_vec_dot_sign1_f16_generic(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_SIGN1;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_sign1 * GGML_RESTRICT x = vx;
+    const ggml_fp16_t * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        const uint64_t bits = x[i].qs;
+        const ggml_fp16_t * yp = y + i*qk;
+        for (int j = 0; j < qk; ++j) {
+            const float v = GGML_CPU_FP16_TO_FP32(yp[j]);
+            // SIGN1 convention: bit 0 => +1, bit 1 => -1.
+            sumf += ((bits >> j) & UINT64_C(1)) ? -v : v;
+        }
+    }
+
+    *s = sumf;
+}
 
 void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK1_0;

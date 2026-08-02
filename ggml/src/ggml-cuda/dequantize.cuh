@@ -43,6 +43,19 @@ static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const in
     v.y = (c1 - 1) * d;
 }
 
+static __device__ __forceinline__ void dequantize_sign1(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_sign1 * x = (const block_sign1 *) vx;
+
+    const uint64_t bits = x[ib].qs;
+    const int bit_index_0 = iqs;
+    const int bit_index_1 = iqs + 1;
+    const int bit_0 = (bits >> bit_index_0) & 1;
+    const int bit_1 = (bits >> bit_index_1) & 1;
+
+    v.x = 1.0f - 2.0f*bit_0;
+    v.y = 1.0f - 2.0f*bit_1;
+}
+
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_0 * x = (const block_q4_0 *) vx;
 
