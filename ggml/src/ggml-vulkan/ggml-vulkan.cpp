@@ -9034,7 +9034,13 @@ static void ggml_vk_matmul_id(
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
                                               nei0, nei1, nbi1, ne11, padded_n, fused_scale ? 1u : 0u };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, scale }, pc, { m, nei1, n_as });
+    if (pipeline->parameter_count == 5) {
+        // Dedicated SIGN1 MMQ shaders predate the optional fused-scale binding.
+        GGML_ASSERT(!fused_scale);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, scale }, pc, { m, nei1, n_as });
+    }
 }
 
 static bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
@@ -10832,16 +10838,15 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const bool dbdbd_v2048 = fused_din != nullptr && fused_dmid != nullptr && ne00 == 2048 && ne01 == 1024;
     const bool dbdbd_v512  = fused_din == nullptr && fused_dmid != nullptr && ne00 == 512  && ne01 == 1024;
     const bool dbdbd_u512  = fused_din == nullptr && fused_dmid != nullptr && ne00 == 1024 && ne01 == 512;
-    const bool dbdbd_u2048 = fused_din == nullptr && fused_dmid != nullptr && ne00 == 1024 && ne01 == 2048;
+    const bool dbdbd_u2048 = fused_din == nullptr && fused_dmid != nullptr && ne00 == 1024 && ne01 == 2048 &&
+        ctx->num_additional_fused_ops == 1 && node_idx + 1 < cgraph->n_nodes &&
+        cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL;
     const bool dbdbd_static = dbdbd_v2048 || dbdbd_v512 || dbdbd_u512 || dbdbd_u2048;
 
     if (dbdbd_v2048 || dbdbd_v512 || dbdbd_u512) {
         GGML_ASSERT(ctx->num_additional_fused_ops == 0);
     }
-    if (dbdbd_u2048) {
-        GGML_ASSERT(ctx->num_additional_fused_ops == 1);
-        GGML_ASSERT(cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL);
-    }
+
 
     const bool x_non_contig = !ggml_vk_dim01_contiguous(src0);
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
