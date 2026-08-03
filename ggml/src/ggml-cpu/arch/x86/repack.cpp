@@ -1767,6 +1767,56 @@ void ggml_gemv_sign1_8x8_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const v
             s[col + r] = sign1_hsum_float_8(acc[r]);
         }
     }
+#elif defined(__AVX2__)
+    const __m256i ones_8  = _mm256_set1_epi8(1);
+    const __m256i ones_16 = _mm256_set1_epi16(1);
+    const __m256i byte_shuf = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+            2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+    const __m256i bit_masks = _mm256_setr_epi8(
+            1, 2, 4, 8, 16, 32, 64, (char) -128, 1, 2, 4, 8, 16, 32, 64, (char) -128,
+            1, 2, 4, 8, 16, 32, 64, (char) -128, 1, 2, 4, 8, 16, 32, 64, (char) -128);
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i all_ones = _mm256_cmpeq_epi8(zero, zero);
+
+    for (int64_t col = 0; col < (int64_t) nc; col += 8) {
+        __m256 acc[8];
+        for (int r = 0; r < 8; ++r) {
+            acc[r] = _mm256_setzero_ps();
+        }
+
+        const size_t tile_offset = (size_t) (col / 8) * (size_t) nb;
+        const block_sign1x8 * xb = x + tile_offset;
+        for (int64_t ib = 0; ib < nb; ++ib) {
+            const size_t y_index = 2u * (size_t) ib;
+            const block_q8_1 & y0 = y[y_index + 0];
+            const block_q8_1 & y1 = y[y_index + 1];
+            const __m256i q0 = _mm256_loadu_si256((const __m256i *) y0.qs);
+            const __m256i q1 = _mm256_loadu_si256((const __m256i *) y1.qs);
+            const __m256 d0 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32((ggml_half) (y0.data.ds & 0xffffu)));
+            const __m256 d1 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32((ggml_half) (y1.data.ds & 0xffffu)));
+
+            for (int r = 0; r < 8; ++r) {
+                const uint64_t bits = xb[ib].qs[r];
+                const __m256i masked0 = _mm256_and_si256(
+                    _mm256_shuffle_epi8(_mm256_set1_epi32((int) (uint32_t) bits), byte_shuf), bit_masks);
+                const __m256i masked1 = _mm256_and_si256(
+                    _mm256_shuffle_epi8(_mm256_set1_epi32((int) (uint32_t) (bits >> 32)), byte_shuf), bit_masks);
+                const __m256i sm0 = _mm256_andnot_si256(_mm256_cmpeq_epi8(masked0, zero), all_ones);
+                const __m256i sm1 = _mm256_andnot_si256(_mm256_cmpeq_epi8(masked1, zero), all_ones);
+                const __m256i sy0 = _mm256_sub_epi8(_mm256_xor_si256(q0, sm0), sm0);
+                const __m256i sy1 = _mm256_sub_epi8(_mm256_xor_si256(q1, sm1), sm1);
+                const __m256i dot0 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy0), ones_16);
+                const __m256i dot1 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy1), ones_16);
+                acc[r] = _mm256_add_ps(acc[r], _mm256_mul_ps(d0, _mm256_cvtepi32_ps(dot0)));
+                acc[r] = _mm256_add_ps(acc[r], _mm256_mul_ps(d1, _mm256_cvtepi32_ps(dot1)));
+            }
+        }
+
+        for (int r = 0; r < 8; ++r) {
+            s[col + r] = sign1_hsum_float_8(acc[r]);
+        }
+    }
 #else
     for (int64_t col = 0; col < (int64_t) nc; col += 8) {
         const size_t tile_offset = (size_t) (col / 8) * (size_t) nb;

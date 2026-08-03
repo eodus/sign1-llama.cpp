@@ -573,7 +573,7 @@ static void ggml_cuda_mul_rows_id_impl(
 
 void ggml_cuda_op_mul_rows_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_mul_rows_id_impl(ctx, dst->src[0], dst->src[1], dst->src[2], dst);
-    if (dst->src[0]->ne[1] != 1) {
+    if (dst->src[0]->ne[1] != 1 && (ctx.mul_rows_id_graph_count++ % 4) == 0) {
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
     }
 }

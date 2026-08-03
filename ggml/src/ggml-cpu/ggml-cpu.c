@@ -1520,7 +1520,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                     ? (i11      + i12*ne11)*row_size
                     : (i11*nb11 + i12*nb12));
 
-                float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
+                char * dst_col = (char *) dst->data + (i1*nb1 + i2*nb2);
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
@@ -1531,7 +1531,13 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                     }
                 }
 
-                memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
+                const int64_t count = MIN(iir0 + blck_0, ir0_end) - iir0;
+                if (dst->type == GGML_TYPE_F32) {
+                    memcpy(dst_col + iir0*nb0, tmp, count*sizeof(float));
+                } else {
+                    GGML_ASSERT(dst->type == GGML_TYPE_F16);
+                    ggml_cpu_fp32_to_fp16(tmp, (ggml_fp16_t *) (dst_col + iir0*nb0), count);
+                }
             }
         }
     }
@@ -1571,7 +1577,8 @@ static void ggml_compute_forward_mul_mat_id(
     GGML_ASSERT(nb10 == ggml_type_size(src1->type));
 
     // dst cannot be transposed or permuted
-    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(nb0 == ggml_type_size(dst->type));
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
@@ -1595,6 +1602,11 @@ static void ggml_compute_forward_mul_mat_id(
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
 
+    float * input_scratch = NULL;
+    if (src1->type == GGML_TYPE_F16 && src1->type != vec_dot_type) {
+        input_scratch = incr_ptr_aligned(&wdata_cur, nth * ne10 * sizeof(float), sizeof(int64_t));
+    }
+
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
     if (src1->type != vec_dot_type) {
@@ -1606,7 +1618,7 @@ static void ggml_compute_forward_mul_mat_id(
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
 
 #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1625,9 +1637,17 @@ static void ggml_compute_forward_mul_mat_id(
                     size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
+                    const int64_t block_count = (ne10_block_end - ne10_block_start) * bs;
+                    const char * source = (const char *) src1->data
+                            + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10;
+                    const float * source_f32 = (const float *) source;
+                    if (src1->type == GGML_TYPE_F16) {
+                        source_f32 = input_scratch + ith * ne10;
+                        ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) source, (float *) source_f32, block_count);
+                    }
+                    from_float(source_f32,
+                               (void *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                               block_count);
                 }
             }
         }
@@ -2891,6 +2911,10 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        // per-thread F16 input conversion scratch
+                        if (src1->type == GGML_TYPE_F16 && src1->type != vec_dot_type) {
+                            cur += (size_t) n_tasks * src1->ne[0] * sizeof(float) + sizeof(int64_t);
+                        }
                     } break;
                 case GGML_OP_MUL_ROWS_ID:
                     {
