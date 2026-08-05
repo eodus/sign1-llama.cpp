@@ -283,7 +283,7 @@ Why 64?
 
 The GGUF therefore contains actual `SIGN1` tensors, not Q1_0 used informally and not a hidden dense
 reconstruction. The type is wired through serialization, loading, backend dispatch, and correctness tests. The
-implementation details are in the code; or, more realistically, your AI will read them =).
+implementation details are in the code. More realistically, your AI will read the code for you =).
 
 This model requires our SIGN1/DBDBD llama.cpp branch; stock llama.cpp does not understand the tensor type or the
 factorized Qwen graph. Reusing Q1_0 as the sign carrier would not remove that requirement. The runtime would still
