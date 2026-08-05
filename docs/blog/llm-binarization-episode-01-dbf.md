@@ -6,7 +6,9 @@
 [Model](https://huggingface.co/eodus/Qwen3.6-35B-A3B-DBF-SIGN1)
 
 **TL;DR:** Structural binary quantization for llama.cpp, demonstrated on the routed experts of
-Qwen3.6-35B-A3B: slightly smaller than Q2_K, better model quality, and approximately the same Vulkan speed.
+Qwen3.6-35B-A3B. At `2.555 bpe`, DBF/SIGN1 is slightly smaller than Q2_K, delivers near-Q3_K model quality
+(`3.30 bpe` scalar-equivalent by measured NLL interpolation), and runs within 1.63% in prompt processing and
+0.46% in token generation of Q2_K on Vulkan.
 
 Can we replace most of an LLM's weights with `+1` and `-1`, making matrix multiplication effectively
 addition? And does it have any merit?
@@ -15,7 +17,9 @@ The answer is **yes** to both questions. For the first question, there are two a
 in a binary or ternary format from the beginning. BitNet is the best-known example
 [[1]](#ref-bitnet) [[2]](#ref-bitnet158). Or we can train a floating-point model first and convert it to binary
 afterward. The strongest method we found for this second path is **Double Binary Factorization (DBF)**,
-introduced by Vladimír Boža and Vladimír Macko of Comenius University Bratislava [[4]](#ref-dbf). This series
+introduced by Vladimír Boža and Vladimír Macko of Comenius University Bratislava in
+*Addition Is Almost All You Need: Compressing Large Language Models with Double Binary Factorization*
+[[4]](#ref-dbf). This series
 begins with their method and the systems work required to make it a runnable model.
 
 The merit is also two-fold.
