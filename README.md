@@ -1,5 +1,9 @@
 # llama.cpp
 
+> **Experimental SIGN1 / DBDBD research branch.** This public branch implements packed
+> one-bit matrices and Double Binary Factorization for routed Qwen MoE experts.
+> See [SIGN1.md](SIGN1.md) for scope, credit, build instructions, tests, and limitations.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
