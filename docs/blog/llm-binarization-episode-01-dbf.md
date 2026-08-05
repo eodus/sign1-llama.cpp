@@ -607,17 +607,25 @@ Qwen3.6-35B-A3B is a practical controlled battlefield, not the final target. The
 same representation and kernel ideas survive larger expert dimensions, different routing distributions, and newer
 frontier MoE architectures.
 
-Two immediate candidates are **DeepSeek-V4-Flash** and **GLM-5.2**. DeepSeek-V4-Flash is a 284B-parameter MoE
-with 13B activated parameters, 43 layers, 256 routed experts, and one-million-token context
-[[18]](#ref-deepseek-v4-flash). Its experts use 4096-wide hidden states and 2048-wide MoE intermediates, giving a
-materially different factorization and kernel regime from this Qwen model. GLM-5.2 has 78 layers, 6144-wide hidden
-states, 2048-wide MoE intermediates, 256 routed experts with eight selected per token, and a one-million-token
-context [[19]](#ref-glm52). Both are open-weight, actively deployed model families for which expert storage and
-memory traffic matter substantially.
+The most practical next port is **GLM-4.5-Air**: 106B total / 12B active parameters, 46 layers, 128 routed experts,
+a 4096-wide hidden state, and 1408-wide expert intermediates [[19]](#ref-glm45air). It fits comfortably on one
+128 GB Strix Halo after ordinary low-bit quantization, while its expert geometry and routing differ enough from
+Qwen to make the transfer meaningful.
+
+Two larger targets are **MiniMax-M2.5** and **DeepSeek-V4-Flash**. MiniMax-M2.5 is a 230B / 10B-active MoE with
+62 layers, 256 experts, 3072-wide hidden states, and 1536-wide expert intermediates [[20]](#ref-minimax-m25).
+DeepSeek-V4-Flash is a 284B / 13B-active MoE with 43 layers, 256 routed experts, 4096-wide hidden states,
+2048-wide MoE intermediates, and one-million-token context [[18]](#ref-deepseek-v4-flash). Both are close enough
+to the one-Halo memory boundary that a Q2-scale structural representation is operationally valuable rather than
+merely a matrix experiment.
+
+GLM-5.2 is a less practical immediate target. Its 78-layer, 6144×2048, 256-expert geometry implies hundreds of
+billions of expert parameters; even a Q2-scale expert payload alone exceeds one Halo's memory. It belongs to a
+multi-node follow-up, not the first transfer test.
 
 These are not promised ports. They are falsification targets. A representation that wins only on one convenient
-Qwen geometry is a useful kernel experiment; one that transfers across Qwen, DeepSeek, and GLM begins to look like
-a general post-training binary format.
+Qwen geometry is a useful kernel experiment; one that transfers across Qwen, GLM, MiniMax, and DeepSeek begins to
+look like a general post-training binary format.
 
 ---
 
@@ -709,8 +717,11 @@ DBF is not a new miracle, but it is a working machine built from an idea worth t
 18. <a id="ref-deepseek-v4-flash"></a>DeepSeek-AI,
     “[DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash),”
     official model card, configuration, and open weights, 2026.
-19. <a id="ref-glm52"></a>GLM-5 Team / Z.ai,
-    “[GLM-5.2](https://huggingface.co/zai-org/GLM-5.2),”
+19. <a id="ref-glm45air"></a>GLM-4.5 Team / Z.ai,
+    “[GLM-4.5-Air](https://huggingface.co/zai-org/GLM-4.5-Air),”
+    official model card, configuration, and open weights, 2025.
+20. <a id="ref-minimax-m25"></a>MiniMax-AI,
+    “[MiniMax-M2.5](https://huggingface.co/MiniMaxAI/MiniMax-M2.5),”
     official model card, configuration, and open weights, 2026.
 
 BibTeX metadata is available in [`episode-01-dbf.bib`](episode-01-dbf.bib).
