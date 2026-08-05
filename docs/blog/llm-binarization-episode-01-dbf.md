@@ -1,7 +1,7 @@
 # LLM Binarization — Episode One: DBF aka _Addition Is (Almost) All You Need_
 
 **Sasha Shlemov**, with **Drinkins, personal AI assistant** ·
-[LinkedIn](https://www.linkedin.com/in/shlemovalex/) · [Runtime](https://github.com/eodus/sign1-llama.cpp) ·
+[Runtime](https://github.com/eodus/sign1-llama.cpp) ·
 [Scripts and results](https://github.com/eodus/dbf-sign1) ·
 [Model](https://huggingface.co/eodus/Qwen3.6-35B-A3B-DBF-SIGN1)
 
@@ -20,11 +20,12 @@ begins with their method and the systems work required to make it a runnable mod
 
 The merit is also two-fold.
 
-**First: performance.** Addition is faster than multiplication. This is true even on modern general-purpose
-consumer hardware; we have measurements and present them below. It becomes significantly more important when the
-chip is designed for binary arithmetic rather than asked to emulate it through general floating-point or integer
-multipliers. Microsoft's BitNet work demonstrates both the software and hardware potential of this direction
-[[2]](#ref-bitnet158) [[3]](#ref-bitnetcpp).
+**First: performance.** Binary weights replace general weight multiplication with sign selection, addition, and
+popcount arithmetic. On our general-purpose consumer hardware, two binary factor products plus three diagonal
+scalers run within 1.63% in prompt processing and 0.46% in token generation of one Q2_K product. The opportunity
+becomes larger when the chip is designed for binary arithmetic rather than asked to emulate it through general
+floating-point or integer multipliers. Microsoft's BitNet work demonstrates both the software and hardware potential
+of this direction [[2]](#ref-bitnet158) [[3]](#ref-bitnetcpp).
 
 **Second: quantization quality.** DBF established that a *structural*, SVD-like binary decomposition can
 approximate LLM matrices better than leading *scalar* quantizers at the same storage budget [[4]](#ref-dbf).
@@ -53,13 +54,13 @@ Concretely, we present:
 
 1. the [exact binary weights](https://huggingface.co/eodus/Qwen3.6-35B-A3B-DBF-SIGN1) used in our experiments:
    Qwen3.6-35B-A3B [[5]](#ref-qwen36) with its routed FFN experts converted to DBF at a Q2_K-scale bit budget;
-2. a converter script for checkpoints that preserve the Qwen3.6-35B-A3B tensor structure: fine-tunes,
-   merged variants, and other models learned on top of the same base. Supporting dimensionally different
-   members of the broader hybrid-MoE family, such as Qwen3.5-35B-A3B [[10]](#ref-qwen35-35b),
-   Qwen3.5-122B-A10B [[11]](#ref-qwen35-122b), and Qwen3.5-397B-A17B [[12]](#ref-qwen35-397b),
-   should be straightforward parameterization, but we have not implemented or validated it yet;
+2. the conversion pipeline used for the tested Qwen3.6-35B-A3B checkpoint. Fine-tunes and merged variants that
+   preserve its exact tensor structure should require no architectural change, but we have not validated them.
+   Dimensionally different hybrid-MoE models, such as Qwen3.5-35B-A3B [[10]](#ref-qwen35-35b),
+   Qwen3.5-122B-A10B [[11]](#ref-qwen35-122b), and Qwen3.5-397B-A17B [[12]](#ref-qwen35-397b), require explicit
+   parameterization and testing;
 3. Vulkan, CPU, and CUDA/HIP kernels integrated into our public llama.cpp branch
-   [[6]](#ref-sign1-llama). The optimized Vulkan path reaches parity with llama.cpp's Q2_K implementation
+   [[6]](#ref-sign1-llama). The optimized Vulkan path reaches near-parity with llama.cpp's Q2_K implementation
    on our hardware;
 4. benchmarks showing better model quality at approximately the same size and speed as vanilla Q2_K.
 
@@ -426,12 +427,12 @@ The final implementation keeps two different winners. Prompt processing (MMQ) us
 matrix-vector multiplication uses `mix()`. There is no reason to force one arithmetic formulation onto workloads
 with different shapes and parallelism.
 
-And addition really is faster than multiplication. DBDBD evaluates **two** binary matrix products plus three
-explicit diagonal scalers in approximately the time Q2_K evaluates **one** quantized matrix product. The
-comparison includes the complete model path, not an operation-count thought experiment. DBDBD performs more
-logical stages and still reaches end-to-end parity because its binary cores replace general weight
-multiplication with sign selection, integer addition, or popcount arithmetic. The scalers are not free; they are
-included in the measured result.
+The measured result is narrower and more useful than the slogan: DBDBD evaluates **two** binary matrix products
+plus three explicit diagonal scalers in approximately the time Q2_K evaluates **one** quantized matrix product.
+The comparison includes the complete model path, not an operation-count thought experiment. DBDBD performs more
+logical stages and still reaches near-parity because its binary cores replace general weight multiplication with
+sign selection, integer addition, or popcount arithmetic. The scalers are not free; they are included in the
+measured result.
 
 Performance depended as much on execution *regimes* as on arithmetic: how many rows and columns one
 workgroup owns, how many workgroups are exposed to the scheduler, which intermediates use expert-major order,
